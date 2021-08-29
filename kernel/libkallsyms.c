@@ -182,7 +182,8 @@ static char kallsyms_get_symbol_type(unsigned int off)
 
 
 static struct seq_file *seq_file;
-static unsigned long file_size;
+static unsigned long file_size_dyn; /* size of ET_DYN output */
+static unsigned long file_size_rel; /* size of ET_REL output */
 
 static char *kallsyms_name_types;
 static unsigned long kallsyms_names_size;
@@ -194,7 +195,8 @@ static struct vm_area_struct *global_vma;
 static unsigned long global_vma_pos;
 static void * global_write_pos;
 static void * global_write_start;
-static struct proc_dir_entry* proc_entry;
+static struct proc_dir_entry* proc_entry;     /* /proc/libkallsyms.so */
+static struct proc_dir_entry* proc_entry_rel; /* /proc/libkallsyms.a  */
 
 static lks_module_t* modules_head = NULL;
 static lks_module_t* modules_tail = NULL;
@@ -621,44 +623,48 @@ static unsigned long elfMaker_calcSize(lks_module_t *mods, unsigned int num_modu
         iter = (lks_module_t*)iter->next;
         i++;
     }
-    /* We now build a debug .strtab distinct from .dynstr. All symbol names
-     * in .strtab get "@ker" appended, while .dynstr remains original.
-     * Since we do a 1:1 copy of every symbol name (one per symbol) the
-     * additional size is 4 bytes ("@ker") per real symbol (NULL entry excluded).
-     * total_syms counts real symbols (excluding the implicit NULL we add later),
-     * so debugStrTabLen = strTabLen + 4 * total_syms.
-     * (If duplicates existed they'd have independent copies already.) */
-    unsigned long debugStrTabLen = strTabLen + (4UL * total_syms);
-    /* Produce both runtime .dynsym and full .symtab/.strtab (debug) */
-    unsigned long hashable = total_syms; // globals (symbol 0 is NULL)
-    unsigned int nbuckets = 1;
-    if (hashable) {
-        unsigned long tmp = (hashable / 4) + 1;
-        // small_next_prime logic inline (subset)
-        static const unsigned short primes[] = {1,3,5,7,11,13,17,19,23,29,31,37,43,47,53,59,61,67,71,73,79,83,89,97,101,103,107,109,113,127,131,137,139,149};
-        unsigned int pi;
-        for (pi = 0; pi < sizeof(primes)/sizeof(primes[0]); ++pi) if (primes[pi] >= tmp) { nbuckets = primes[pi]; break; }
-        if (nbuckets < tmp) nbuckets = ((unsigned)tmp | 1) + 2;
+    if (type == ET_REL) {
+        /* Minimal ET_REL: no program headers, no .dynsym/.dynstr/.gnu.* or .dynamic.
+         * Keep only: .text, .symtab, .strtab, .shstrtab
+         */
+        const int text_offset = ALIGNMENT;
+        /* Place symtab after a small gap for code (mirror previous 0x100 to keep spacing predictable) */
+        const int symtab_offset = text_offset + 0x100;
+        const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
+        const int shstrtab_offset = strtab_offset + strTabLen;
+        const int sh_offset = ((shstrtab_offset + sizeof(shstrtab))/ALIGNMENT + 1) * ALIGNMENT;
+        const int file_size = sh_offset + sizeof(Elf64_Shdr) * 5; /* null + .text + .symtab + .strtab + .shstrtab */
+        return file_size;
+    } else {
+        /* ET_DYN full: includes .dynsym/.dynstr/.gnu.hash/.gnu.version(_d)/.dynamic plus debug .symtab/.strtab */
+        unsigned long debugStrTabLen = strTabLen + (4UL * total_syms);
+        unsigned long hashable = total_syms;
+        unsigned int nbuckets = 1;
+        if (hashable) {
+            unsigned long tmp = (hashable / 4) + 1;
+            static const unsigned short primes[] = {1,3,5,7,11,13,17,19,23,29,31,37,43,47,53,59,61,67,71,73,79,83,89,97,101,103,107,109,113,127,131,137,139,149};
+            unsigned int pi;
+            for (pi = 0; pi < sizeof(primes)/sizeof(primes[0]); ++pi) if (primes[pi] >= tmp) { nbuckets = primes[pi]; break; }
+            if (nbuckets < tmp) nbuckets = ((unsigned)tmp | 1) + 2;
+        }
+        unsigned int bloom_size = choose_bloom_size(hashable);
+        unsigned long gnu_hash_size = 16 + (unsigned long)bloom_size * 8 + (unsigned long)nbuckets * 4 + hashable * 4;
+        unsigned long gnu_hash_padded = (gnu_hash_size + 7) & ~7UL;
+        const int ph_offset = sizeof(Elf64_Ehdr);
+        const int text_offset = ALIGNMENT;
+        const int dynsym_offset = text_offset + 0x100; /* keep gap */
+        const int dynstr_offset = dynsym_offset + sizeof(Elf64_Sym) * (total_syms + 1);
+        unsigned long dynstr_padded_len = strTabLen;
+        if (dynstr_padded_len & 7) dynstr_padded_len = (dynstr_padded_len + 7) & ~7UL;
+        const int gnu_hash_offset = dynstr_offset + dynstr_padded_len; /* dynstr only, 8-aligned */
+        const int dyn_offset = gnu_hash_offset + gnu_hash_padded;
+        const int symtab_offset = (dyn_offset + sizeof(Elf64_Dyn) * 5 + 16 + 7) & ~7; /* 8-align */
+        const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
+        const int shstrtab_offset = strtab_offset + debugStrTabLen;
+        const int sh_offset = ((shstrtab_offset + sizeof(shstrtab))/ALIGNMENT + 1) * ALIGNMENT;
+        const int file_size = sh_offset + sizeof(Elf64_Shdr) * 11; /* null + .text + .gnu.hash + .dynsym + .dynstr + .gnu.version + .gnu.version_d + .dynamic + .symtab + .strtab + .shstrtab */
+        return file_size;
     }
-    unsigned int bloom_size = choose_bloom_size(hashable);
-    unsigned long gnu_hash_size = 16 + (unsigned long)bloom_size * 8 + (unsigned long)nbuckets * 4 + hashable * 4;
-    unsigned long gnu_hash_padded = (gnu_hash_size + 7) & ~7UL;
-    const int ph_offset = sizeof(Elf64_Ehdr);
-    const int text_offset = ALIGNMENT;
-    const int dynsym_offset = text_offset + 0x100; /* keep gap */
-    const int dynstr_offset = dynsym_offset + sizeof(Elf64_Sym) * (total_syms + 1);
-    /* Pad dynstr to 8-byte alignment for gnu_hash_offset */
-    unsigned long dynstr_padded_len = strTabLen;
-    if (dynstr_padded_len & 7) dynstr_padded_len = (dynstr_padded_len + 7) & ~7UL;
-    const int gnu_hash_offset = dynstr_offset + dynstr_padded_len; /* dynstr only, 8-aligned */
-    const int dyn_offset = gnu_hash_offset + gnu_hash_padded;
-    const int symtab_offset = (dyn_offset + sizeof(Elf64_Dyn) * 5 + 16 + 7) & ~7; /* 8-align */
-    const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
-    const int shstrtab_offset = strtab_offset + debugStrTabLen;
-    const int sh_offset = ((shstrtab_offset + sizeof(shstrtab))/ALIGNMENT + 1) * ALIGNMENT;
-    const int file_size = sh_offset + sizeof(Elf64_Shdr) * 9; /* null + .text + .gnu.hash + .dynsym + .dynstr + .dynamic + .symtab + .strtab + .shstrtab */
-    (void)type;
-    return file_size;
 }
 
 
@@ -736,6 +742,136 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
         if (iter->strtab && iter->strtab_size>0) memcpy(unified_strtab + module_strtab_base_offset[i], iter->strtab, iter->strtab_size);
         iter = (lks_module_t*)iter->next; i++; }
 
+    if (type == ET_REL) {
+        /* Minimal ET_REL writer: only .text, .symtab, .strtab, .shstrtab; no program headers */
+        const int text_offset = ALIGNMENT;
+        const int symtab_offset = text_offset + 0x100;
+        const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
+        const int shstrtab_offset = strtab_offset + strTabLen;
+        const int sh_offset = ((shstrtab_offset + sizeof(shstrtab))/ALIGNMENT + 1) * ALIGNMENT;
+
+        PRINT_INFOF("libkallsyms(ET_REL): layout\n");
+        PRINT_INFOF("  .text:     0x%x\n", text_offset);
+        PRINT_INFOF("  .symtab:   0x%x\n", symtab_offset);
+        PRINT_INFOF("  .strtab:   0x%x\n", strtab_offset);
+        PRINT_INFOF("  .shstrtab: 0x%x\n", shstrtab_offset);
+        PRINT_INFOF("  shdrs:     0x%x\n", sh_offset);
+
+        unsigned long cur_pos = 0;
+
+        // === ELF Header ===
+        Elf64_Ehdr ehdr = {0};
+        memcpy(ehdr.e_ident, ELFMAG, SELFMAG);
+        ehdr.e_ident[EI_CLASS] = ELFCLASS64;
+        ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
+        ehdr.e_ident[EI_VERSION] = EV_CURRENT;
+        ehdr.e_ident[EI_OSABI] = ELFOSABI_SYSV;
+        ehdr.e_type = ET_REL;
+        ehdr.e_machine = EM_X86_64;
+        ehdr.e_version = EV_CURRENT;
+        ehdr.e_entry = 0;
+        ehdr.e_phoff = 0;          // no program headers in ET_REL
+        ehdr.e_shoff = sh_offset;
+        ehdr.e_flags = 0;
+        ehdr.e_ehsize = sizeof(Elf64_Ehdr);
+        ehdr.e_phentsize = sizeof(Elf64_Phdr);
+        ehdr.e_phnum = 0;
+        ehdr.e_shentsize = sizeof(Elf64_Shdr);
+        ehdr.e_shnum = 5;          // null + .text + .symtab + .strtab + .shstrtab
+        ehdr.e_shstrndx = 4;       // index of .shstrtab
+
+    PRINT_INFOF("libkallsyms(ET_REL): writing ELF header, size: %d\n", (int)sizeof(ehdr));
+        write_func(&ehdr, sizeof(ehdr));
+        cur_pos += sizeof(ehdr);
+
+        // pad to .text
+        write_func(zeros, text_offset - cur_pos);
+        cur_pos = text_offset;
+
+    // minimal code payload (same as ET_DYN for now)
+    unsigned char code[] = {0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3};
+    unsigned char code2[] = {0xb8, 0x2b, 0x00, 0x00, 0x00, 0xc3};
+    PRINT_INFOF("libkallsyms(ET_REL): writing .text (size=%zu)\n", (size_t)(sizeof(code) + sizeof(code2)));
+        write_func(code, sizeof(code));
+        write_func(code2, sizeof(code2));
+        cur_pos += sizeof(code) + sizeof(code2);
+
+        // .symtab
+    PRINT_INFOF("libkallsyms(ET_REL): writing .symtab count=%lu\n", (unsigned long)(total_syms + 1));
+        write_func(zeros, symtab_offset - cur_pos); cur_pos = symtab_offset;
+        write_func(merged_syms, sizeof(Elf64_Sym) * (total_syms + 1));
+        cur_pos += sizeof(Elf64_Sym) * (total_syms + 1);
+
+        // .strtab (use unified_strtab)
+    PRINT_INFOF("libkallsyms(ET_REL): writing .strtab size=%lu\n", strTabLen);
+        write_func(zeros, strtab_offset - cur_pos); cur_pos = strtab_offset;
+        write_func(unified_strtab, strTabLen);
+        cur_pos += strTabLen;
+
+        // .shstrtab
+    PRINT_INFOF("libkallsyms(ET_REL): writing .shstrtab size=%zu\n", sizeof(shstrtab));
+        write_func(zeros, shstrtab_offset - cur_pos); cur_pos = shstrtab_offset;
+        write_func(shstrtab, sizeof(shstrtab));
+        cur_pos += sizeof(shstrtab);
+
+        // Section headers
+        write_func(zeros, sh_offset - cur_pos); cur_pos = sh_offset;
+
+        // null
+        Elf64_Shdr sh_null = {0};
+        write_func(&sh_null, sizeof(sh_null)); cur_pos += sizeof(sh_null);
+
+    // .text
+        Elf64_Shdr sh_text = {0};
+        sh_text.sh_name = 1; // ".text"
+        sh_text.sh_type = SHT_PROGBITS;
+        sh_text.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+        sh_text.sh_addr = 0;
+        sh_text.sh_offset = text_offset;
+        sh_text.sh_size = sizeof(code) + sizeof(code2);
+        sh_text.sh_addralign = 1;
+        write_func(&sh_text, sizeof(sh_text)); cur_pos += sizeof(sh_text);
+
+        // .symtab
+        Elf64_Shdr sh_symtab = {0};
+        sh_symtab.sh_name = 70; // .symtab
+        sh_symtab.sh_type = SHT_SYMTAB;
+        sh_symtab.sh_offset = symtab_offset;
+        sh_symtab.sh_size = sizeof(Elf64_Sym) * (total_syms + 1);
+        sh_symtab.sh_link = 3; // index of .strtab
+        sh_symtab.sh_info = 1; // one local (NULL)
+        sh_symtab.sh_addralign = 8;
+        sh_symtab.sh_entsize = sizeof(Elf64_Sym);
+        write_func(&sh_symtab, sizeof(sh_symtab)); cur_pos += sizeof(sh_symtab);
+
+        // .strtab
+        Elf64_Shdr sh_strtab = {0};
+        sh_strtab.sh_name = 78; // .strtab
+        sh_strtab.sh_type = SHT_STRTAB;
+        sh_strtab.sh_offset = strtab_offset;
+        sh_strtab.sh_size = strTabLen;
+        sh_strtab.sh_addralign = 1;
+        write_func(&sh_strtab, sizeof(sh_strtab)); cur_pos += sizeof(sh_strtab);
+
+        // .shstrtab
+        Elf64_Shdr sh_shstrtab = {0};
+        sh_shstrtab.sh_name = 86; // .shstrtab
+        sh_shstrtab.sh_type = SHT_STRTAB;
+        sh_shstrtab.sh_offset = shstrtab_offset;
+        sh_shstrtab.sh_size = sizeof(shstrtab);
+        sh_shstrtab.sh_addralign = 1;
+        write_func(&sh_shstrtab, sizeof(sh_shstrtab)); cur_pos += sizeof(sh_shstrtab);
+
+        PRINT_INFOF("libkallsyms(ET_REL): Wrote minimal relocatable ELF (no dynamic sections)\n");
+
+        /* cleanup */
+        FREE(module_strtab_base_offset);
+        FREE(unified_strtab);
+        FREE(merged_syms);
+        return 0;
+    }
+
+    /* === ET_DYN path === */
     /* Create .dynsym/.dynstr as (possibly reordered) copies for runtime */
     Elf64_Sym *dynsym = (Elf64_Sym*)MALLOC(sizeof(Elf64_Sym) * (total_syms + 1));
     if (!dynsym) { PRINT_ERR("libkallsyms: dynsym alloc failed"); FREE(module_strtab_base_offset); FREE(unified_strtab); FREE(merged_syms); return -1; }
@@ -892,7 +1028,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
     ehdr.e_ident[EI_VERSION] = EV_CURRENT;
     ehdr.e_ident[EI_OSABI] = ELFOSABI_SYSV;
-    ehdr.e_type = type; // ET_DYN or ET_REL
+    ehdr.e_type = ET_DYN;
     ehdr.e_machine = EM_X86_64;
     ehdr.e_version = EV_CURRENT;
     ehdr.e_entry = 0; // No entry point
@@ -901,14 +1037,10 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     ehdr.e_flags = 0;
     ehdr.e_ehsize = sizeof(Elf64_Ehdr);
     ehdr.e_phentsize = sizeof(Elf64_Phdr);
-    if (type == ET_DYN) {
-        ehdr.e_phnum = 2;
-    } else {
-        ehdr.e_phnum = 1; // Only text and dynamic
-    }
+    ehdr.e_phnum = 2; // PT_LOAD + PT_DYNAMIC
     ehdr.e_shentsize = sizeof(Elf64_Shdr);
-    ehdr.e_shnum = 11; // add .gnu.version + .gnu.version_d
-    ehdr.e_shstrndx = 10; // new index of .shstrtab
+    ehdr.e_shnum = 11; // null + .text + .gnu.hash + .dynsym + .dynstr + .gnu.version + .gnu.version_d + .dynamic + .symtab + .strtab + .shstrtab
+    ehdr.e_shstrndx = 10; // index of .shstrtab
 
     PRINT_INFOF("libkallsyms: writing ELF header, size: %d\n", sizeof(ehdr));
     write_func(&ehdr, sizeof(ehdr));
@@ -938,12 +1070,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     phdr_dynamic.p_vaddr  = dyn_offset;
     phdr_dynamic.p_paddr  = phdr_dynamic.p_vaddr;
     phdr_dynamic.p_filesz = sizeof(dyn_entries);
-    if (type == ET_DYN) {
-        write_func(&phdr_dynamic, sizeof(phdr_dynamic));
-    }
-    else {
-        write_func(zeros, sizeof(phdr_dynamic)); // Write zeros if not ET_DYN
-    }
+    write_func(&phdr_dynamic, sizeof(phdr_dynamic));
 
     cur_pos += sizeof(phdr_dynamic);
 
@@ -1210,21 +1337,56 @@ static int kallsyms_elf_show(struct seq_file *m, void *v) {
     return retVal;
 }
 
+/* === ET_REL procfs (.a) === */
+static int kallsyms_ar_show(struct seq_file *m, void *v) {
+    int retVal;
+    seq_file = m;
+    pr_info("%s: starting kallsyms_ar_show (ET_REL)", MODULE_NAME);
+    LKS_LOCK(&modules_lock);
+    retVal = makeElf(ET_REL, modules_head, modules_count, &mywrite);
+    LKS_UNLOCK(&modules_lock);
+    if (retVal != 0) {
+        pr_err("Failed to create ET_REL ELF file\n");
+    }
+    return retVal;
+}
+
 static int kallsyms_elf_open(struct inode *inode, struct file *file) {
     pr_info("%s: kallsyms_elf_open called", MODULE_NAME);
     return single_open(file, kallsyms_elf_show, NULL);
 }
 
+static int kallsyms_ar_open(struct inode *inode, struct file *file) {
+    pr_info("%s: kallsyms_ar_open called", MODULE_NAME);
+    return single_open(file, kallsyms_ar_show, NULL);
+}
+
 static loff_t kallsyms_lseek(struct file *file, loff_t offset, int whence)
 {
 	struct seq_file *m = file->private_data;
-    pr_info("%s: kallsyms_lseek called, size is: %lu", MODULE_NAME, file_size);
+    pr_info("%s: kallsyms_lseek called, size is: %lu", MODULE_NAME, file_size_dyn);
 
     if (whence == SEEK_END) {
         if (offset > 0)
             return -EINVAL;
 
-        offset += file_size; //TODO: This can differ between calls and can be outdated due to insertions/removals
+        offset += file_size_dyn; //TODO: This can differ between calls and can be outdated due to insertions/removals
+        return seq_lseek(file, offset, SEEK_SET);
+    }
+
+    return seq_lseek(file, offset, whence);
+}
+
+static loff_t kallsyms_ar_lseek(struct file *file, loff_t offset, int whence)
+{
+    struct seq_file *m = file->private_data;
+    pr_info("%s: kallsyms_ar_lseek called, size is: %lu", MODULE_NAME, file_size_rel);
+
+    if (whence == SEEK_END) {
+        if (offset > 0)
+            return -EINVAL;
+
+        offset += file_size_rel;
         return seq_lseek(file, offset, SEEK_SET);
     }
 
@@ -1237,7 +1399,7 @@ static unsigned long mem_write(const void* data, unsigned long size) {
         pr_err("global_vma is NULL\n");
         return -1;
     }
-    void * write_end = global_write_start + file_size;
+    void * write_end = global_write_start + file_size_dyn;
 
     if (size > 1024) {
         pr_alert("%s: mem_write called with > 1024 len, data: %lx, size: %x\n", MODULE_NAME, data, size);
@@ -1362,6 +1524,13 @@ static const struct proc_ops kallsyms_elf_fops = {
     .proc_mmap    = kallsyms_mmap,
 };
 
+static const struct proc_ops kallsyms_ar_fops = {
+    .proc_open    = kallsyms_ar_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = kallsyms_ar_lseek,
+    .proc_release = single_release,
+};
+
 
 
 
@@ -1411,22 +1580,84 @@ static int lks_module_notify(struct notifier_block *nb, unsigned long op,
 
             struct mod_kallsyms *kallsyms = &mod->core_kallsyms;
 
-            new_mod->symtab = kallsyms->symtab;
-            new_mod->num_symtab = kallsyms->num_symtab;
-            new_mod->strtab = kallsyms->strtab;
-            
-            //calculate strtab size
-            unsigned int strtab_size = 0;
-            unsigned int i;
-            unsigned int max_end = 0;
-            for (i = 0; i < new_mod->num_symtab; i++) {
-                unsigned int end = new_mod->symtab[i].st_name + strlen(&new_mod->strtab[new_mod->symtab[i].st_name]) + 1;
-                if (end > max_end) {
-                    max_end = end;
+            /* Build a filtered symtab/strtab that only contains publicly
+             * available symbols (global/default visibility, defined).
+             * We copy those into fresh vmalloc'ed buffers owned by new_mod.
+             */
+            do {
+                Elf64_Sym *orig_sym = (Elf64_Sym *)kallsyms->symtab;
+                const char *orig_str = (const char *)kallsyms->strtab;
+                unsigned int orig_n  = kallsyms->num_symtab;
+
+                /* First pass: count and total string length */
+                unsigned int pub_count = 0; /* not including index 0 */
+                unsigned long str_total = 1; /* leading NUL */
+                for (unsigned int s = 1; s < orig_n; ++s) {
+                    unsigned char bind = ELF64_ST_BIND(orig_sym[s].st_info);
+                    unsigned char type = ELF64_ST_TYPE(orig_sym[s].st_info);
+                    unsigned char vis  = ELF64_ST_VISIBILITY(orig_sym[s].st_other);
+                    if ((bind == STB_GLOBAL || bind == STB_WEAK) &&
+                        vis == STV_DEFAULT &&
+                        orig_sym[s].st_shndx != SHN_UNDEF &&
+                        type != STT_SECTION && type != STT_FILE) {
+                        const char *name = orig_sym[s].st_name ? (orig_str + orig_sym[s].st_name) : "";
+                        if (name && *name) {
+                            ++pub_count;
+                            str_total += strlen(name) + 1;
+                        }
+                    }
                 }
-            }
-            new_mod->strtab_size = max_end;
-            pr_info("%s: module %s has %u symbols, strtab size: %u\n", MODULE_NAME, mod->name, new_mod->num_symtab, new_mod->strtab_size);
+
+                /* Allocate new tables */
+                Elf64_Sym *new_sym = (Elf64_Sym *)vmalloc(sizeof(Elf64_Sym) * (pub_count + 1));
+                char *new_str = (char *)vmalloc(str_total ? str_total : 1);
+                if (!new_sym || !new_str) {
+                    if (new_sym) vfree(new_sym);
+                    if (new_str) vfree(new_str);
+                    vfree(new_mod);
+                    pr_alert("%s: failed to allocate filtered sym/str tables for %s\n", MODULE_NAME, mod->name);
+                    return -ENOMEM;
+                }
+
+                /* Initialize string table */
+                unsigned long woff = 0;
+                new_str[woff++] = '\0';
+
+                /* Preserve 0th symbol */
+                memset(&new_sym[0], 0, sizeof(new_sym[0]));
+
+                /* Second pass: copy filtered symbols and names */
+                unsigned int out_idx = 1;
+                for (unsigned int s = 1; s < orig_n; ++s) {
+                    unsigned char bind = ELF64_ST_BIND(orig_sym[s].st_info);
+                    unsigned char type = ELF64_ST_TYPE(orig_sym[s].st_info);
+                    unsigned char vis  = ELF64_ST_VISIBILITY(orig_sym[s].st_other);
+                    if ((bind == STB_GLOBAL || bind == STB_WEAK) &&
+                        vis == STV_DEFAULT &&
+                        orig_sym[s].st_shndx != SHN_UNDEF &&
+                        type != STT_SECTION && type != STT_FILE) {
+                        const char *name = orig_sym[s].st_name ? (orig_str + orig_sym[s].st_name) : "";
+                        if (!name || !*name)
+                            continue;
+
+                        /* Copy symbol and rewrite st_name */
+                        new_sym[out_idx] = orig_sym[s];
+                        new_sym[out_idx].st_name = (Elf64_Word)woff;
+                        size_t nlen = strlen(name) + 1;
+                        memcpy(new_str + woff, name, nlen);
+                        woff += nlen;
+                        ++out_idx;
+                    }
+                }
+
+                new_mod->symtab = new_sym;
+                new_mod->num_symtab = out_idx; /* includes index 0 */
+                new_mod->strtab = new_str;
+                new_mod->strtab_size = woff;
+
+                pr_info("%s: module %s filtered: %u/%u public symbols, strtab size: %lu\n",
+                        MODULE_NAME, mod->name, out_idx ? (out_idx - 1) : 0, orig_n, woff);
+            } while (0);
 
             if (dryrun) {
                 vfree(new_mod);
@@ -1447,15 +1678,12 @@ static int lks_module_notify(struct notifier_block *nb, unsigned long op,
             modules_tail = new_mod;
             modules_count++;
 
-            //recompute file size
-            file_size = elfMaker_calcSize(modules_head, modules_count, ET_DYN);
-            //set filesize on proc entry
-            if (proc_entry) {
-                proc_set_size(proc_entry, file_size);
-            }
-            else {
-                pr_alert("%s: failed to find proc entry to set size\n", MODULE_NAME);
-            }
+            // recompute file sizes for both ET_DYN (.so) and ET_REL (.a)
+            file_size_dyn = elfMaker_calcSize(modules_head, modules_count, ET_DYN);
+            file_size_rel = elfMaker_calcSize(modules_head, modules_count, ET_REL);
+            // set filesize on proc entries
+            if (proc_entry) proc_set_size(proc_entry, file_size_dyn);
+            if (proc_entry_rel) proc_set_size(proc_entry_rel, file_size_rel);
 
             LKS_UNLOCK(&modules_lock);
 
@@ -1481,18 +1709,19 @@ static int lks_module_notify(struct notifier_block *nb, unsigned long op,
                                 modules_tail = prev;
                             }
 
+                            /* Free filtered tables we allocated on COMING */
+                            if (curr->symtab)
+                                vfree(curr->symtab);
+                            if (curr->strtab)
+                                vfree(curr->strtab);
                             vfree(curr);
                             modules_count--;
 
-                            //recompute file size
-                            file_size = elfMaker_calcSize(modules_head, modules_count, ET_DYN);
-                            //set filesize on proc entry
-                            if (proc_entry) {
-                                proc_set_size(proc_entry, file_size);
-                            }
-                            else {
-                                pr_alert("%s: failed to find proc entry to set size\n", MODULE_NAME);
-                            }
+                            // recompute file sizes for both entries
+                            file_size_dyn = elfMaker_calcSize(modules_head, modules_count, ET_DYN);
+                            file_size_rel = elfMaker_calcSize(modules_head, modules_count, ET_REL);
+                            if (proc_entry) proc_set_size(proc_entry, file_size_dyn);
+                            if (proc_entry_rel) proc_set_size(proc_entry_rel, file_size_rel);
                         }
                         pr_info("%s: module %s removed, new count: %u\n", MODULE_NAME, mod->name, modules_count);
                         LKS_UNLOCK(&modules_lock);
@@ -1598,11 +1827,14 @@ static int __init libkallsyms_init_syms(void) {
     pr_info("%s: created lks_module_t\n", MODULE_NAME);
 
 
-    pr_info("%s: creating proc fs entry\n", MODULE_NAME);
+    pr_info("%s: creating proc fs entries (.so and .a)\n", MODULE_NAME);
     proc_entry = proc_create("libkallsyms.so", 0777, NULL, &kallsyms_elf_fops);
-    file_size = elfMaker_calcSize(modules_head, modules_count, ET_DYN);
-    proc_set_size(proc_entry, file_size);
-    pr_info("%s: proc fs entry created correctly\n", MODULE_NAME);
+    proc_entry_rel = proc_create("libkallsyms.a", 0777, NULL, &kallsyms_ar_fops);
+    file_size_dyn = elfMaker_calcSize(modules_head, modules_count, ET_DYN);
+    file_size_rel = elfMaker_calcSize(modules_head, modules_count, ET_REL);
+    if (proc_entry)     proc_set_size(proc_entry, file_size_dyn);
+    if (proc_entry_rel) proc_set_size(proc_entry_rel, file_size_rel);
+    pr_info("%s: proc fs entries created correctly (.so size=%lu, .a size=%lu)\n", MODULE_NAME, file_size_dyn, file_size_rel);
 
     //register module notifier
     int ret;
