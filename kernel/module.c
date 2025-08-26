@@ -15,7 +15,7 @@
 #include <linux/kallsyms.h>
 #include <linux/buildid.h>
 #include <linux/file.h>
-#include <linux/fs.h>
+#include <linux/fs.h> // for fileno, fsync if needed
 #include <linux/sysfs.h>
 #include <linux/kernel.h>
 #include <linux/kernel_read_file.h>
@@ -66,6 +66,9 @@
 #ifndef ARCH_SHF_SMALL
 #define ARCH_SHF_SMALL 0
 #endif
+
+#define MODL(fmt, ...) \
+	pr_info("module:%s:" fmt, __func__, ##__VA_ARGS__)
 
 /*
  * Modules' sections will be aligned on page boundaries
@@ -2441,7 +2444,7 @@ static void layout_sections(struct module *mod, struct load_info *info)
 	for (i = 0; i < info->hdr->e_shnum; i++)
 		info->sechdrs[i].sh_entsize = ~0UL;
 
-	pr_debug("Core section allocation order:\n");
+	MODL("Core section allocation order:\n");
 	for (m = 0; m < ARRAY_SIZE(masks); ++m) {
 		for (i = 0; i < info->hdr->e_shnum; ++i) {
 			Elf_Shdr *s = &info->sechdrs[i];
@@ -2453,7 +2456,7 @@ static void layout_sections(struct module *mod, struct load_info *info)
 			    || module_init_layout_section(sname))
 				continue;
 			s->sh_entsize = get_offset(mod, &mod->core_layout.size, s, i);
-			pr_debug("\t%s\n", sname);
+			MODL("\t%s\n", sname);
 		}
 		switch (m) {
 		case 0: /* executable */
@@ -2474,7 +2477,7 @@ static void layout_sections(struct module *mod, struct load_info *info)
 		}
 	}
 
-	pr_debug("Init section allocation order:\n");
+	MODL("Init section allocation order:\n");
 	for (m = 0; m < ARRAY_SIZE(masks); ++m) {
 		for (i = 0; i < info->hdr->e_shnum; ++i) {
 			Elf_Shdr *s = &info->sechdrs[i];
@@ -2487,7 +2490,7 @@ static void layout_sections(struct module *mod, struct load_info *info)
 				continue;
 			s->sh_entsize = (get_offset(mod, &mod->init_layout.size, s, i)
 					 | INIT_OFFSET_MASK);
-			pr_debug("\t%s\n", sname);
+			MODL("\t%s\n", sname);
 		}
 		switch (m) {
 		case 0: /* executable */
@@ -2706,7 +2709,7 @@ static void layout_symtab(struct module *mod, struct load_info *info)
 	symsect->sh_flags |= SHF_ALLOC;
 	symsect->sh_entsize = get_offset(mod, &mod->init_layout.size, symsect,
 					 info->index.sym) | INIT_OFFSET_MASK;
-	pr_debug("\t%s\n", info->secstrings + symsect->sh_name);
+	MODL("\t%s\n", info->secstrings + symsect->sh_name);
 
 	src = (void *)info->hdr + symsect->sh_offset;
 	nsrc = symsect->sh_size / sizeof(*src);
@@ -2733,7 +2736,7 @@ static void layout_symtab(struct module *mod, struct load_info *info)
 	strsect->sh_flags |= SHF_ALLOC;
 	strsect->sh_entsize = get_offset(mod, &mod->init_layout.size, strsect,
 					 info->index.str) | INIT_OFFSET_MASK;
-	pr_debug("\t%s\n", info->secstrings + strsect->sh_name);
+	MODL("\t%s\n", info->secstrings + strsect->sh_name);
 
 	/* We'll tack temporary mod_kallsyms on the end. */
 	mod->init_layout.size = ALIGN(mod->init_layout.size,
@@ -3230,44 +3233,66 @@ static int check_modinfo(struct module *mod, struct load_info *info, int flags)
 	const char *modmagic = get_modinfo(info, "vermagic");
 	int err;
 
-	if (flags & MODULE_INIT_IGNORE_VERMAGIC)
-		modmagic = NULL;
+	MODL("enter check_modinfo\n");
 
-	/* This is allowed: modprobe --force will invalidate it. */
+	if (flags & MODULE_INIT_IGNORE_VERMAGIC) {
+		MODL("ignoring vermagic due to flags\n");
+		modmagic = NULL;
+	}
+
 	if (!modmagic) {
+		MODL("no modmagic found, attempting forced load\n");
+		MODL("calling try_to_force_load\n");
 		err = try_to_force_load(mod, "bad vermagic");
-		if (err)
+		if (err) {
+			MODL("force load denied: %d\n", err);
 			return err;
+		}
 	} else if (!same_magic(modmagic, vermagic, info->index.vers)) {
 		pr_err("%s: version magic '%s' should be '%s'\n",
 		       info->name, modmagic, vermagic);
+		MODL("vermagic mismatch\n");
 		return -ENOEXEC;
+	} else {
+		MODL("vermagic check passed: '%s'\n", modmagic);
 	}
 
+	MODL("checking if module is in-tree\n");
 	if (!get_modinfo(info, "intree")) {
+		MODL("module is out-of-tree\n");
 		if (!test_taint(TAINT_OOT_MODULE))
 			pr_warn("%s: loading out-of-tree module taints kernel.\n",
 				mod->name);
+		MODL("calling add_taint_module for OOT\n");
 		add_taint_module(mod, TAINT_OOT_MODULE, LOCKDEP_STILL_OK);
 	}
 
+	MODL("calling check_modinfo_retpoline\n");
 	check_modinfo_retpoline(mod, info);
 
+	MODL("checking if module is from staging\n");
 	if (get_modinfo(info, "staging")) {
+		MODL("module is from staging\n");
+		MODL("calling add_taint_module for staging\n");
 		add_taint_module(mod, TAINT_CRAP, LOCKDEP_STILL_OK);
 		pr_warn("%s: module is from the staging directory, the quality "
 			"is unknown, you have been warned.\n", mod->name);
 	}
 
+	MODL("calling check_modinfo_livepatch\n");
 	err = check_modinfo_livepatch(mod, info);
-	if (err)
+	if (err) {
+		MODL("livepatch check failed: %d\n", err);
 		return err;
+	}
 
-	/* Set up license info based on the info section */
+	MODL("calling set_license\n");
 	set_license(mod, get_modinfo(info, "license"));
 
+	MODL("exit check_modinfo: OK\n");
 	return 0;
 }
+
 
 static int find_module_sections(struct module *mod, struct load_info *info)
 {
@@ -3520,58 +3545,59 @@ static struct module *layout_and_allocate(struct load_info *info, int flags)
 	unsigned int ndx;
 	int err;
 
+	MODL("enter layout_and_allocate\n");
+	
 	err = check_modinfo(info->mod, info, flags);
-	if (err)
+	if (err) {
+		MODL("check_modinfo failed: %d\n", err);
 		return ERR_PTR(err);
-
-	/* Allow arches to frob section contents and sizes.  */
+	}
+	
+	MODL("before module_frob_arch_sections\n");
 	err = module_frob_arch_sections(info->hdr, info->sechdrs,
 					info->secstrings, info->mod);
-	if (err < 0)
+	if (err < 0) {
+		MODL("module_frob_arch_sections failed: %d\n", err);
 		return ERR_PTR(err);
+	}
 
+	MODL("before module_enforce_rwx_sections\n");
 	err = module_enforce_rwx_sections(info->hdr, info->sechdrs,
 					  info->secstrings, info->mod);
-	if (err < 0)
+	if (err < 0) {
+		MODL("module_enforce_rwx_sections failed: %d\n", err);
 		return ERR_PTR(err);
+	}
 
-	/* We will do a special allocation for per-cpu sections later. */
 	info->sechdrs[info->index.pcpu].sh_flags &= ~(unsigned long)SHF_ALLOC;
 
-	/*
-	 * Mark ro_after_init section with SHF_RO_AFTER_INIT so that
-	 * layout_sections() can put it in the right place.
-	 * Note: ro_after_init sections also have SHF_{WRITE,ALLOC} set.
-	 */
+	MODL("before find_sec\n");
 	ndx = find_sec(info, ".data..ro_after_init");
 	if (ndx)
 		info->sechdrs[ndx].sh_flags |= SHF_RO_AFTER_INIT;
-	/*
-	 * Mark the __jump_table section as ro_after_init as well: these data
-	 * structures are never modified, with the exception of entries that
-	 * refer to code in the __init section, which are annotated as such
-	 * at module load time.
-	 */
+
 	ndx = find_sec(info, "__jump_table");
 	if (ndx)
 		info->sechdrs[ndx].sh_flags |= SHF_RO_AFTER_INIT;
 
-	/*
-	 * Determine total sizes, and put offsets in sh_entsize.  For now
-	 * this is done generically; there doesn't appear to be any
-	 * special cases for the architectures.
-	 */
+	MODL("before layout_sections\n");
 	layout_sections(info->mod, info);
+
+	MODL("before layout_symtab\n");
 	layout_symtab(info->mod, info);
 
-	/* Allocate and move to the final place */
+	MODL("before move_module\n");
 	err = move_module(info->mod, info);
-	if (err)
+	if (err) {
+		MODL("move_module failed: %d\n", err);
 		return ERR_PTR(err);
+	}
 
-	/* Module has been copied to its final place now: return it. */
 	mod = (void *)info->sechdrs[info->index.mod].sh_addr;
+	MODL("before kmemleak_load_module\n");
 	kmemleak_load_module(mod, info);
+
+	MODL("exit layout_and_allocate: mod=%p name=%s\n", mod, mod->name);
 	return mod;
 }
 
@@ -3910,8 +3936,9 @@ static void cfi_init(struct module *mod);
 static int load_module(struct load_info *info, const char __user *uargs,
 		       int flags)
 {
+    pr_info("called\n");
+    int err;
 	struct module *mod;
-	long err = 0;
 	char *after_dashes;
 
 	/*
@@ -3927,6 +3954,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	 * checks against info->len more correct.
 	 */
 	err = module_sig_check(info, flags);
+    pr_info("after module_sig_check, err=%ld\n", err);
 	if (err)
 		goto free_copy;
 
@@ -3935,6 +3963,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	 * sections.
 	 */
 	err = elf_validity_check(info);
+    pr_info("after elf_validity_check, err=%ld\n", err);
 	if (err) {
 		pr_err("Module has invalid ELF structures\n");
 		goto free_copy;
@@ -3945,6 +3974,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	 * in the info structure.
 	 */
 	err = setup_load_info(info, flags);
+    pr_info("after setup_load_info, err=%ld\n", err);
 	if (err)
 		goto free_copy;
 
@@ -3957,19 +3987,22 @@ static int load_module(struct load_info *info, const char __user *uargs,
 		pr_err("Module %s is blacklisted\n", info->name);
 		goto free_copy;
 	}
-
+    pr_info("after blacklist check\n");
 	err = rewrite_section_headers(info, flags);
+    pr_info("after rewrite_section_headers, err=%ld\n", err);
 	if (err)
 		goto free_copy;
 
 	/* Check module struct version now, before we try to use module. */
 	if (!check_modstruct_version(info, info->mod)) {
 		err = -ENOEXEC;
+		pr_info("bad modstruct version\n");
 		goto free_copy;
 	}
 
 	/* Figure out module layout, and allocate all the memory. */
 	mod = layout_and_allocate(info, flags);
+    pr_info("after layout_and_allocate, mod=%p\n", mod);
 	if (IS_ERR(mod)) {
 		err = PTR_ERR(mod);
 		goto free_copy;
@@ -3979,6 +4012,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	/* Reserve our place in the list. */
 	err = add_unformed_module(mod);
+    pr_info("after add_unformed_module, err=%ld\n", err);
 	if (err)
 		goto free_module;
 
@@ -3994,11 +4028,13 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	/* To avoid stressing percpu allocator, do this once we're unique. */
 	err = percpu_modalloc(mod, info);
+    pr_info("after percpu_modalloc, err=%ld\n", err);
 	if (err)
 		goto unlink_mod;
 
 	/* Now module is in final location, initialize linked lists, etc. */
 	err = module_unload_init(mod);
+    pr_info("after module_unload_init, err=%ld\n", err);
 	if (err)
 		goto unlink_mod;
 
@@ -4009,10 +4045,12 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	 * find optional sections.
 	 */
 	err = find_module_sections(mod, info);
+    pr_info("after find_module_sections, err=%ld\n", err);
 	if (err)
 		goto free_unload;
 
 	err = check_module_license_and_versions(mod);
+    pr_info("after check_module_license_and_versions, err=%ld\n", err);
 	if (err)
 		goto free_unload;
 
@@ -4021,24 +4059,30 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	/* Fix up syms, so that st_value is a pointer to location. */
 	err = simplify_symbols(mod, info);
+    pr_info("after simplify_symbols, err=%ld\n", err);
 	if (err < 0)
 		goto free_modinfo;
 
 	err = apply_relocations(mod, info);
+    pr_info("after apply_relocations, err=%ld\n", err);
 	if (err < 0)
 		goto free_modinfo;
 
 	err = post_relocation(mod, info);
+    pr_info("after post_relocation, err=%ld\n", err);
 	if (err < 0)
 		goto free_modinfo;
 
+	pr_info("before flush_module_icache\n");
 	flush_module_icache(mod);
+	pr_info("after flush_module_icache\n");
 
 	/* Setup CFI for the module. */
 	cfi_init(mod);
 
 	/* Now copy in args */
 	mod->args = strndup_user(uargs, ~0UL >> 1);
+	pr_info("after strndup_user, mod->args=%p\n", mod->args);
 	if (IS_ERR(mod->args)) {
 		err = PTR_ERR(mod->args);
 		goto free_arch_cleanup;
@@ -4052,10 +4096,12 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	/* Finally it's fully formed, ready to start executing. */
 	err = complete_formation(mod, info);
+    pr_info("after complete_formation, err=%ld\n", err);
 	if (err)
 		goto ddebug_cleanup;
 
 	err = prepare_coming_module(mod);
+    pr_info("after prepare_coming_module, err=%ld\n", err);
 	if (err)
 		goto bug_cleanup;
 
@@ -4063,6 +4109,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	after_dashes = parse_args(mod->name, mod->args, mod->kp, mod->num_kp,
 				  -32768, 32767, mod,
 				  unknown_module_param_cb);
+	pr_info("after parse_args, after_dashes=%p\n", after_dashes);
 	if (IS_ERR(after_dashes)) {
 		err = PTR_ERR(after_dashes);
 		goto coming_cleanup;
@@ -4073,11 +4120,13 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	/* Link in to sysfs. */
 	err = mod_sysfs_setup(mod, info, mod->kp, mod->num_kp);
+    pr_info("after mod_sysfs_setup, err=%ld\n", err);
 	if (err < 0)
 		goto coming_cleanup;
 
 	if (is_livepatch_module(mod)) {
 		err = copy_module_elf(mod, info);
+        pr_info("after copy_module_elf, err=%ld\n", err);
 		if (err < 0)
 			goto sysfs_cleanup;
 	}
@@ -4093,12 +4142,14 @@ static int load_module(struct load_info *info, const char __user *uargs,
  sysfs_cleanup:
 	mod_sysfs_teardown(mod);
  coming_cleanup:
+	pr_info("coming_cleanup\n");
 	mod->state = MODULE_STATE_GOING;
 	destroy_params(mod->kp, mod->num_kp);
 	blocking_notifier_call_chain(&module_notify_list,
 				     MODULE_STATE_GOING, mod);
 	klp_module_going(mod);
  bug_cleanup:
+	pr_info("bug_cleanup\n");
 	mod->state = MODULE_STATE_GOING;
 	/* module_bug_cleanup needs module_mutex protection */
 	mutex_lock(&module_mutex);
@@ -4106,18 +4157,23 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	mutex_unlock(&module_mutex);
 
  ddebug_cleanup:
+	pr_info("ddebug_cleanup\n");
 	ftrace_release_mod(mod);
 	dynamic_debug_remove(mod, info->debug);
 	synchronize_rcu();
 	kfree(mod->args);
  free_arch_cleanup:
+	pr_info("free_arch_cleanup\n");
 	cfi_cleanup(mod);
 	module_arch_cleanup(mod);
  free_modinfo:
+	pr_info("free_modinfo\n");
 	free_modinfo(mod);
  free_unload:
+	pr_info("free_unload\n");
 	module_unload_free(mod);
  unlink_mod:
+	pr_info("unlink_mod\n");
 	mutex_lock(&module_mutex);
 	/* Unlink carefully: kallsyms could be walking list. */
 	list_del_rcu(&mod->list);
@@ -4127,11 +4183,13 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	synchronize_rcu();
 	mutex_unlock(&module_mutex);
  free_module:
+	pr_info("free_module\n");
 	/* Free lock-classes; relies on the preceding sync_rcu() */
 	lockdep_free_key_range(mod->core_layout.base, mod->core_layout.size);
 
 	module_deallocate(mod, info);
  free_copy:
+	pr_info("free_copy\n");
 	free_copy(info);
 	return err;
 }

@@ -74,6 +74,8 @@
 
 #include "uid16.h"
 
+#include <linux/symbiote_hook.h>
+
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
 #endif
@@ -956,6 +958,64 @@ void symbi_query(struct pt_regs* regs){
   }
 }
 
+//helpers for aliasing the user space stack in kernel address space
+static DEFINE_MUTEX(symbi_hook_lock);
+static symbi_hook_t __rcu symbi_hook_ptr;
+
+DEFINE_STATIC_KEY_FALSE(symbi_hook_enabled);
+
+/* Exported API */
+int symbi_register_hook(symbi_hook_t fn)
+{
+	int ret = 0;
+
+	if (!fn)
+		return -EINVAL;
+
+	mutex_lock(&symbi_hook_lock);
+	if (rcu_dereference_protected(symbi_hook_ptr, lockdep_is_held(&symbi_hook_lock))) {
+		ret = -EBUSY;           /* only one hook supported */
+		goto out;
+	}
+
+	rcu_assign_pointer(symbi_hook_ptr, fn);
+	static_branch_enable(&symbi_hook_enabled);
+out:
+	mutex_unlock(&symbi_hook_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(symbi_register_hook);
+
+void symbi_unregister_hook(symbi_hook_t fn)
+{
+	mutex_lock(&symbi_hook_lock);
+
+	/* Only the owner can unregister; ignore stray calls */
+	if (rcu_dereference_protected(symbi_hook_ptr, lockdep_is_held(&symbi_hook_lock)) == fn) {
+		RCU_INIT_POINTER(symbi_hook_ptr, NULL);
+		/* Make sure no CPU is still running the old hook */
+		synchronize_rcu();
+		static_branch_disable(&symbi_hook_enabled);
+	}
+
+	mutex_unlock(&symbi_hook_lock);
+}
+EXPORT_SYMBOL_GPL(symbi_unregister_hook);
+
+/* Internal fast-path helper used by the syscall */
+static inline void symbi_maybe_call_hook(struct pt_regs *regs,
+                                         const struct SymbiReg *sreg)
+{
+	if (static_branch_unlikely(&symbi_hook_enabled)) {
+		rcu_read_lock();
+		symbi_hook_t fn = rcu_dereference(symbi_hook_ptr);
+		if (fn)
+			fn(regs, sreg);
+		rcu_read_unlock();
+	}
+}
+
+
 void symbi_lower(struct pt_regs* regs, struct SymbiReg* sreg){
   if(current->symbiote_elevated == 1 ){
     current->symbiote_elevated = 0;
@@ -1101,6 +1161,8 @@ SYSCALL_DEFINE1(elevate, unsigned long, flags)
   if(sreg.debug){
     symbi_debug_entry(regs, &sreg);
   }
+
+  symbi_maybe_call_hook(regs, &sreg);
 
   // Careful with order, obviously only executes first matching.
   if(sreg.query){

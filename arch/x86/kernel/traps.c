@@ -752,6 +752,22 @@ struct bad_iret_stack *fixup_bad_iret(struct bad_iret_stack *s)
 	/* Copy the remainder of the stack from the current stack. */
 	__memcpy(&tmp, s, offsetof(struct bad_iret_stack, regs.ip));
 
+	pr_info("Bad iret stack: "
+		"error_entry_ret=%p, "
+		"regs.ip=%lx, regs.sp=%lx, "
+		"regs.cs=%x, regs.ss=%x, "
+		"regs.flags=%lx\n",
+		s->error_entry_ret, s->regs.ip, s->regs.sp,
+		s->regs.cs, s->regs.ss, s->regs.flags);
+	
+	pr_info("replacement iret stack: "
+		"error_entry_ret=%p, "
+		"regs.ip=%lx, regs.sp=%lx, "
+		"regs.cs=%x, regs.ss=%x, "
+		"regs.flags=%lx\n",
+		tmp.error_entry_ret, tmp.regs.ip, tmp.regs.sp,
+		tmp.regs.cs, tmp.regs.ss, tmp.regs.flags);
+
 	/* Update the entry stack */
 	__memcpy(new_stack, &tmp, sizeof(tmp));
 

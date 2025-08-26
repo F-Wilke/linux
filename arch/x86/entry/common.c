@@ -82,6 +82,12 @@ __visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
 		regs->ax = __x64_sys_ni_syscall(regs);
 	}
 
+	if (nr == 448) {
+		pr_info("sym_elevate called with regs: "
+			"ip=%lx, sp=%lx, cs=%x, ss=%x, flags=%lx, return; regs->ax %lx\n",
+			regs->ip, regs->sp, regs->cs, regs->ss, regs->flags, regs->ax);
+	}
+
 	instrumentation_end();
 	syscall_exit_to_user_mode(regs);
 }
