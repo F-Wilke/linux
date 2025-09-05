@@ -666,10 +666,6 @@ SYM_INNER_LABEL(symbi_swapgs_restore_regs_and_return_to_usermode_ret, SYM_L_GLOB
 	ud2
 1:
 #endif
-	pushq %rax
-	movq	RSP(%rsp), %rax
-	movq    %rax,  srrar_start
-	popq %rax
 
 	movq	RIP(%rsp), %r15 /* return address in r15 */
 	movq	RSP(%rsp), %r14	 /* user stack in r14 */
@@ -688,11 +684,6 @@ SYM_INNER_LABEL(symbi_swapgs_restore_regs_and_return_to_usermode_ret, SYM_L_GLOB
 	movq	%rsp, %rdi
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp //we go to kernel stack again
 	UNWIND_HINT_EMPTY
-
-	pushq %rax
-	movq	5*8(%rdi), %rax
-	movq 	%rax, PER_CPU_VAR(bef_ker_ds)
-	popq %rax
 
 	/* Copy the IRET frame to the trampoline stack. */
 	pushq	$__KERNEL_DS	/* SS */
@@ -717,10 +708,6 @@ SYM_INNER_LABEL(symbi_swapgs_restore_regs_and_return_to_usermode_ret, SYM_L_GLOB
 	SWAPGS
 
 	/* Swing to user stack and pop flags */
-	pushq 	%rax
-	movq	0x18(%rsp), %rax
-	movq 	%rax, PER_CPU_VAR(bef_rsp_set)
-	popq 	%rax
 
 	movq 0x18(%rsp), %rsp
 	popfq
