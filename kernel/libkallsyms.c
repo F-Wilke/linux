@@ -29,6 +29,7 @@
 #define ELFOSABI_SYSV		0	/* Alias.  */
 #define STV_DEFAULT	0		/* Default symbol visibility rules */
 #define SEEK_SET	0
+#define MODULE_NAME "ker_libkallsyms"
 
 
 #define MALLOC(size) kmalloc(size, GFP_KERNEL)
@@ -63,6 +64,10 @@ extern const u16 kallsyms_token_index[];
 extern const unsigned int kallsyms_markers[];
 extern const u8 kallsyms_seqs_of_names[];
 
+//functions we need from kallsyms
+unsigned int kallsyms_expand_symbol(unsigned int off, char *result, size_t maxlen);
+char kallsyms_get_symbol_type(unsigned int off);
+
 
 struct seq_file *seq_file;
 unsigned long file_size;
@@ -73,6 +78,7 @@ unsigned long kallsyms_per_cpu_names_size;
 unsigned long kallsyms_first_non_per_cpu_name_pos;
 unsigned long kallsyms_per_cpu_symbol_count;
 
+struct vm_area_struct *global_vma;
 unsigned long global_vma_pos;
 void * global_write_pos;
 void * global_write_start;
@@ -196,7 +202,8 @@ unsigned long elfMaker_calcSize(lks_module_t *mods, unsigned int num_modules, ui
     if (!mods || num_modules == 0) return 0;
     unsigned long total_syms = 0;
     unsigned long strTabLen = 1; // leading NUL
-    for (unsigned int i = 0; i < num_modules; i++) {
+    unsigned int i;
+    for (i = 0; i < num_modules; i++) {
         total_syms += mods[i].num_symtab;
         if (mods[i].strtab_size > 0)
             strTabLen += mods[i].strtab_size; // we treat each strtab_size as NOT including a leading NUL duplication
