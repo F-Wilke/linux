@@ -804,10 +804,11 @@ static int lks_module_notify(struct notifier_block *nb, unsigned long op,
 			     void *module)
 {
     bool dryrun = false;
+#ifdef DRYRUN
     if (modules_count > 2) {
         dryrun = true;
     }
-
+#endif
 
     lks_module_t* new_mod = NULL;
     int ret = 0;
