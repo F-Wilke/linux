@@ -35,8 +35,8 @@
 #define MODULE_NAME "ker_libkallsyms"
 
 
-#define MALLOC(size) kmalloc(size, GFP_KERNEL)
-#define FREE(ptr) kfree(ptr)
+#define MALLOC(size) vmalloc(size)
+#define FREE(ptr) vfree(ptr)
 #define PRINT_ERR(msg) pr_err(msg)
 #define PRINT_INFOF(...) pr_info(__VA_ARGS__)
 #define LKS_LOCK(mu)   do { pr_info("%s: mutex_lock at %s:%d\n", MODULE_NAME, __func__, __LINE__); mutex_lock(mu); } while (0)
@@ -56,8 +56,26 @@ typedef struct lks_module {
     void* next;               // Optional descriptive name
 } lks_module_t;
     
-/* Section header string table now includes .gnu.hash */
-static const char shstrtab[] = "\0.text\0.gnu.hash\0.symtab\0.strtab\0.shstrtab\0";
+/* Section header string table (restored .symtab/.strtab) */
+static const char shstrtab[] =
+    "\0.text"
+    "\0.gnu.hash"
+    "\0.dynsym"
+    "\0.dynstr"
+    "\0.dynamic"
+    "\0.symtab"
+    "\0.strtab"
+    "\0.shstrtab\0";
+/* Offsets:
+ *  .text=1
+ *  .gnu.hash=7
+ *  .dynsym=17
+ *  .dynstr=25
+ *  .dynamic=33
+ *  .symtab=42
+ *  .strtab=50
+ *  .shstrtab=58
+ */
 
 /* External kallsyms data (attributes stripped for simplified build environment) */
 extern const unsigned long kallsyms_addresses[] __weak;
@@ -231,6 +249,83 @@ static unsigned int small_next_prime(unsigned int n) {
     return (n | 1) + 2;
 }
 
+/* Conservative GNU bloom size: smallest power-of-two >= hashable/64 (at least 1).
+ * Mirrors ld / gold style heuristic to keep bloom relatively compact while
+ * still scaling with symbol count. For very small tables this yields 1. */
+static unsigned int choose_bloom_size(unsigned long hashable) {
+    unsigned long target = (hashable >> 6); /* hashable / 64 */
+    unsigned int sz = 1;
+    while (sz && sz < target) sz <<= 1; /* stops when sz >= target or overflow */
+    if (sz == 0) sz = 1; /* overflow guard */
+    return sz;
+}
+
+/* Reorder dynamic symbols so that symbols belonging to the same GNU hash bucket
+ * become contiguous, as required by the GNU hash chain traversal algorithm.
+ * We currently treat all symbols after the NULL @0 as global. A more refined
+ * implementation could separate STB_LOCAL and start globals at symoffset.
+ */
+static Elf64_Sym *reorder_dynsym_for_gnu(const Elf64_Sym *in_syms,
+                                         unsigned long dynsym_count,
+                                         unsigned long symoffset,
+                                         const char *strtab) {
+    if (!in_syms || dynsym_count <= symoffset) return NULL;
+    unsigned long hashable = dynsym_count - symoffset; /* number of symbols to hash */
+    /* Must mirror small_next_prime & bucket heuristic in build_gnu_hash_section */
+    unsigned int nbuckets = small_next_prime((unsigned int)(hashable / 4 + 1));
+    if (nbuckets == 0) nbuckets = 1;
+
+    /* First pass: assign each symbol to a bucket */
+    unsigned int *bucket_counts = (unsigned int*)MALLOC(sizeof(unsigned int) * nbuckets);
+    if (!bucket_counts) return NULL;
+    memset(bucket_counts, 0, sizeof(unsigned int) * nbuckets);
+
+    unsigned long i;
+    for (i = symoffset; i < dynsym_count; ++i) {
+        const Elf64_Sym *s = &in_syms[i];
+        if (s->st_name == 0) continue; /* skip nameless */
+        const char *name = strtab + s->st_name;
+        unsigned int h = gnu_hash_compute(name);
+        unsigned int b = h % nbuckets;
+        bucket_counts[b]++;
+    }
+
+    /* Compute prefix sums to know where each bucket's run starts */
+    unsigned long *bucket_offsets = (unsigned long*)MALLOC(sizeof(unsigned long) * nbuckets);
+    if (!bucket_offsets) { FREE(bucket_counts); return NULL; }
+    unsigned long running = symoffset; /* start placing after local(s) */
+    for (i = 0; i < nbuckets; ++i) {
+        bucket_offsets[i] = running;
+        running += bucket_counts[i];
+    }
+
+    /* Output array */
+    Elf64_Sym *out = (Elf64_Sym*)MALLOC(sizeof(Elf64_Sym) * dynsym_count);
+    if (!out) { FREE(bucket_offsets); FREE(bucket_counts); return NULL; }
+    /* Preserve symbol 0 (local null) untouched */
+    if (symoffset > 0) memcpy(out, in_syms, sizeof(Elf64_Sym) * symoffset);
+
+    /* Temp per-bucket position counters (re-use bucket_counts) */
+    memset(bucket_counts, 0, sizeof(unsigned int) * nbuckets);
+
+    for (i = symoffset; i < dynsym_count; ++i) {
+        const Elf64_Sym *s = &in_syms[i];
+        if (s->st_name == 0) continue; /* skip nameless (remain un-placed; they won't be hashed) */
+        const char *name = strtab + s->st_name;
+        unsigned int h = gnu_hash_compute(name);
+        unsigned int b = h % nbuckets;
+        unsigned long pos = bucket_offsets[b] + bucket_counts[b];
+        out[pos] = *s;
+        bucket_counts[b]++;
+    }
+
+    /* Any slots for nameless symbols that were skipped remain zeroed (already) */
+
+    FREE(bucket_offsets);
+    FREE(bucket_counts);
+    return out;
+}
+
 /* Build a .gnu.hash section from an array of dynamic symbols.
  * Inputs:
  *   dynsyms      - pointer to first Elf64_Sym in dynamic symbol table
@@ -258,8 +353,8 @@ int build_gnu_hash_section(const Elf64_Sym *dynsyms,
     unsigned int nbuckets = small_next_prime((unsigned int)(hashable / 4 + 1));
     if (nbuckets == 0) nbuckets = 1; /* ensure >=1 */
 
-    /* Bloom filter sizing: keep it small for few symbols. Use 1 or 2 words. */
-    unsigned int bloom_size = (hashable > 8) ? 2 : 1; /* number of Elf64_Xword entries */
+    /* Bloom filter sizing (conservative ld-like heuristic): power-of-two >= hashable/64 */
+    unsigned int bloom_size = choose_bloom_size(hashable);
     const unsigned int bloom_shift = 6; /* typical value used by GNU ld for 64-bit */
 
     /* Temporary arrays to collect bucket membership and hashes. */
@@ -299,7 +394,7 @@ int build_gnu_hash_section(const Elf64_Sym *dynsyms,
         unsigned int h = gnu_hash_compute(name);
 
         unsigned long rel_index = si - symoffset; /* index in chain array */
-        chain[rel_index] = h; /* low-bit terminator fix-up later */
+        chain[rel_index] = h & ~1U; //ensure we dont set terminator bit yet
 
         /* Bucket logic. */
         unsigned int b = h % nbuckets;
@@ -461,9 +556,9 @@ static lks_module_t* make_lks_mod(char* nameTypes, unsigned long first_address_i
         s->st_other = STV_DEFAULT;
         unsigned long addr = kallsyms_sym_address(first_address_id + i);
         if (addr & (0xfffffffULL << 48)) {
-            s->st_shndx = 1; // heuristic .text
-        } else {
             s->st_shndx = SHN_ABS;
+        } else {
+            s->st_shndx = 1; // heuristic .text
         }
         s->st_value = addr;
         s->st_size = sizeof(void*);
@@ -499,8 +594,8 @@ static unsigned long elfMaker_calcSize(lks_module_t *mods, unsigned int num_modu
         iter = (lks_module_t*)iter->next;
         i++;
     }
-    /* Approximate .gnu.hash size (mirrors build_gnu_hash_section heuristics) */
-    unsigned long hashable = total_syms; // symoffset will be 1, but +1 null -> total_syms symbols hashed
+    /* Produce both runtime .dynsym and full .symtab/.strtab (debug) */
+    unsigned long hashable = total_syms; // globals (symbol 0 is NULL)
     unsigned int nbuckets = 1;
     if (hashable) {
         unsigned long tmp = (hashable / 4) + 1;
@@ -510,19 +605,20 @@ static unsigned long elfMaker_calcSize(lks_module_t *mods, unsigned int num_modu
         for (pi = 0; pi < sizeof(primes)/sizeof(primes[0]); ++pi) if (primes[pi] >= tmp) { nbuckets = primes[pi]; break; }
         if (nbuckets < tmp) nbuckets = ((unsigned)tmp | 1) + 2;
     }
-    unsigned int bloom_size = (hashable > 8) ? 2 : 1;
+    unsigned int bloom_size = choose_bloom_size(hashable);
     unsigned long gnu_hash_size = 16 + (unsigned long)bloom_size * 8 + (unsigned long)nbuckets * 4 + hashable * 4;
     unsigned long gnu_hash_padded = (gnu_hash_size + 7) & ~7UL;
-
     const int ph_offset = sizeof(Elf64_Ehdr);
-    const int text_offset = ALIGNMENT; /* keep existing layout */
-    const int symtab_offset = text_offset + 0x100;
-    const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
-    const int gnu_hash_offset = strtab_offset + strTabLen;
+    const int text_offset = ALIGNMENT;
+    const int dynsym_offset = text_offset + 0x100; /* keep gap */
+    const int dynstr_offset = dynsym_offset + sizeof(Elf64_Sym) * (total_syms + 1);
+    const int gnu_hash_offset = dynstr_offset + strTabLen;
     const int dyn_offset = gnu_hash_offset + gnu_hash_padded;
-    const int shstrtab_offset = dyn_offset + sizeof(Elf64_Dyn) * 5 + 32; /* 5 dynamic entries now */
+    const int symtab_offset = (dyn_offset + sizeof(Elf64_Dyn) * 5 + 16 + 7) & ~7; /* 8-align */
+    const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
+    const int shstrtab_offset = strtab_offset + strTabLen;
     const int sh_offset = ((shstrtab_offset + sizeof(shstrtab))/ALIGNMENT + 1) * ALIGNMENT;
-    const int file_size = sh_offset + sizeof(Elf64_Shdr) * 6; /* + .gnu.hash */
+    const int file_size = sh_offset + sizeof(Elf64_Shdr) * 9; /* null + .text + .gnu.hash + .dynsym + .dynstr + .dynamic + .symtab + .strtab + .shstrtab */
     (void)type;
     return file_size;
 }
@@ -547,7 +643,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
         if (iter->strtab && iter->strtab_size > 0) strTabLen += iter->strtab_size;
         iter = (lks_module_t*)iter->next; i++; }
 
-    /* Build merged symbol table + unified strtab */
+    /* Build merged symbol table + unified strtab (used by both .dynsym/.dynstr only) */
     Elf64_Sym *merged_syms = (Elf64_Sym*)MALLOC(sizeof(Elf64_Sym) * (total_syms + 1));
     if (!merged_syms) { PRINT_ERR("libkallsyms: merged_syms alloc failed"); return -1; }
     memset(merged_syms, 0, sizeof(Elf64_Sym) * (total_syms + 1));
@@ -571,30 +667,44 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
         if (iter->strtab && iter->strtab_size>0) memcpy(unified_strtab + module_strtab_base_offset[i], iter->strtab, iter->strtab_size);
         iter = (lks_module_t*)iter->next; i++; }
 
-    /* Build .gnu.hash */
+    /* Create .dynsym/.dynstr as (possibly reordered) copies for runtime */
+    Elf64_Sym *dynsym = (Elf64_Sym*)MALLOC(sizeof(Elf64_Sym) * (total_syms + 1));
+    if (!dynsym) { PRINT_ERR("libkallsyms: dynsym alloc failed"); FREE(module_strtab_base_offset); FREE(unified_strtab); FREE(merged_syms); return -1; }
+    memcpy(dynsym, merged_syms, sizeof(Elf64_Sym) * (total_syms + 1));
+    Elf64_Sym *reordered = reorder_dynsym_for_gnu(dynsym, total_syms + 1, 1, unified_strtab);
+    if (reordered) { FREE(dynsym); dynsym = reordered; }
+    char *dynstr = (char*)MALLOC(strTabLen);
+    if (!dynstr) { PRINT_ERR("libkallsyms: dynstr alloc failed"); FREE(dynsym); FREE(module_strtab_base_offset); FREE(unified_strtab); FREE(merged_syms); return -1; }
+    memcpy(dynstr, unified_strtab, strTabLen);
+
+    /* Build .gnu.hash against dynsym */
     unsigned char *gnu_hash_blob = NULL; unsigned long gnu_hash_size = 0;
-    if (build_gnu_hash_section(merged_syms, total_syms + 1, unified_strtab, 1, &gnu_hash_blob, &gnu_hash_size) != 0) {
+    if (build_gnu_hash_section(dynsym, total_syms + 1, dynstr, 1, &gnu_hash_blob, &gnu_hash_size) != 0) {
         PRINT_ERR("libkallsyms: build_gnu_hash_section failed"); gnu_hash_size = 0; }
     unsigned long gnu_hash_padded = (gnu_hash_size + 7) & ~((unsigned long)7);
 
     /* Layout */
     const int ph_offset = sizeof(Elf64_Ehdr);
     const int text_offset = ALIGNMENT;
-    const int symtab_offset = text_offset + 0x100;
-    const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
-    const int gnu_hash_offset = strtab_offset + strTabLen;
+    const int dynsym_offset = text_offset + 0x100;
+    const int dynstr_offset = dynsym_offset + sizeof(Elf64_Sym) * (total_syms + 1);
+    const int gnu_hash_offset = dynstr_offset + strTabLen;
     const int dyn_offset = gnu_hash_offset + gnu_hash_padded;
-    const int shstrtab_offset = dyn_offset + sizeof(Elf64_Dyn) * 5 + 32;
+    const int symtab_offset = (dyn_offset + sizeof(Elf64_Dyn)*5 + 16 + 7) & ~7; /* 8-align */
+    const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
+    const int shstrtab_offset = strtab_offset + strTabLen;
     const int sh_offset = ((shstrtab_offset + sizeof(shstrtab))/ALIGNMENT + 1) * ALIGNMENT;
 
     PRINT_INFOF("libkallsyms: ELF layout with .gnu.hash:\n");
     PRINT_INFOF("  ELF header:        0x%lx - 0x%lx\n", 0UL, (unsigned long)ph_offset);
     PRINT_INFOF("  Program headers:   0x%lx - 0x%lx\n", (unsigned long)ph_offset, (unsigned long)text_offset);
-    PRINT_INFOF("  .text:             0x%lx - 0x%lx\n", (unsigned long)text_offset, (unsigned long)symtab_offset);
-    PRINT_INFOF("  .symtab:           0x%lx - 0x%lx\n", (unsigned long)symtab_offset, (unsigned long)strtab_offset);
-    PRINT_INFOF("  .strtab:           0x%lx - 0x%lx\n", (unsigned long)strtab_offset, (unsigned long)gnu_hash_offset);
+    PRINT_INFOF("  .text:             0x%lx - 0x%lx\n", (unsigned long)text_offset, (unsigned long)dynsym_offset);
+    PRINT_INFOF("  .dynsym:           0x%lx - 0x%lx\n", (unsigned long)dynsym_offset, (unsigned long)dynstr_offset);
+    PRINT_INFOF("  .dynstr:           0x%lx - 0x%lx\n", (unsigned long)dynstr_offset, (unsigned long)gnu_hash_offset);
     PRINT_INFOF("  .gnu.hash:         0x%lx - 0x%lx (size=%lu)\n", (unsigned long)gnu_hash_offset, (unsigned long)(gnu_hash_offset+gnu_hash_padded), gnu_hash_size);
-    PRINT_INFOF("  .dynamic:          0x%lx - 0x%lx\n", (unsigned long)dyn_offset, (unsigned long)shstrtab_offset);
+    PRINT_INFOF("  .dynamic:          0x%lx - 0x%lx\n", (unsigned long)dyn_offset, (unsigned long)symtab_offset);
+    PRINT_INFOF("  .symtab:           0x%lx - 0x%lx\n", (unsigned long)symtab_offset, (unsigned long)strtab_offset);
+    PRINT_INFOF("  .strtab:           0x%lx - 0x%lx\n", (unsigned long)strtab_offset, (unsigned long)shstrtab_offset);
     PRINT_INFOF("  .shstrtab:         0x%lx - 0x%lx\n", (unsigned long)shstrtab_offset, (unsigned long)sh_offset);
     PRINT_INFOF("  Section headers:   0x%lx\n", (unsigned long)sh_offset);
 
@@ -604,8 +714,8 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
 #define DT_GNU_HASH 0x6ffffef5
 #endif
     Elf64_Dyn dyn_entries[] = {
-        { DT_SYMTAB, symtab_offset },
-        { DT_STRTAB, strtab_offset },
+        { DT_SYMTAB, dynsym_offset },
+        { DT_STRTAB, dynstr_offset },
         { DT_STRSZ,  strTabLen },
         { DT_GNU_HASH, gnu_hash_offset },
         { DT_NULL, 0 }
@@ -633,8 +743,8 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
         ehdr.e_phnum = 1; // Only text and dynamic
     }
     ehdr.e_shentsize = sizeof(Elf64_Shdr);
-    ehdr.e_shnum = 6; // null + .text + .gnu.hash + .symtab + .strtab + .shstrtab
-    ehdr.e_shstrndx = 5; // .shstrtab index
+    ehdr.e_shnum = 9; // null + .text + .gnu.hash + .dynsym + .dynstr + .dynamic + .symtab + .strtab + .shstrtab
+    ehdr.e_shstrndx = 8; // index of .shstrtab
 
     PRINT_INFOF("libkallsyms: writing ELF header, size: %d\n", sizeof(ehdr));
     write_func(&ehdr, sizeof(ehdr));
@@ -648,7 +758,8 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     phdr.p_offset = 0; //must be page aligned:  libkallsyms.so: ELF load command address/offset not page-aligned
     phdr.p_vaddr = 0;
     phdr.p_paddr = 0;
-    phdr.p_filesz = shstrtab_offset; //up to end of .text dynamic section
+    /* Limit PT_LOAD to end of .dynamic (exclude non-ALLOC debug tables) */
+    phdr.p_filesz = dyn_offset + sizeof(dyn_entries);
     phdr.p_memsz = phdr.p_filesz;
     phdr.p_flags = PF_R | PF_X;
     phdr.p_align = ALIGNMENT;
@@ -687,18 +798,20 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     cur_pos += sizeof(code) + sizeof(code2);
     
     
-    PRINT_INFOF("libkallsyms: seeking symtab_offset\n");
-    write_func(zeros, symtab_offset - cur_pos); cur_pos = symtab_offset;
-    write_func(merged_syms, sizeof(Elf64_Sym) * (total_syms + 1));
+    /* write runtime .dynsym/.dynstr */
+    /* .dynsym */
+    write_func(zeros, dynsym_offset - cur_pos); cur_pos = dynsym_offset;
+    write_func(dynsym, sizeof(Elf64_Sym) * (total_syms + 1));
     cur_pos += sizeof(Elf64_Sym) * (total_syms + 1);
-    PRINT_INFOF("libkallsyms: wrote unified symtable with %lu symbols\n", (unsigned long)total_syms);
+    PRINT_INFOF("libkallsyms: wrote dynsym with %lu symbols (reordered)\n", (unsigned long)total_syms);
     
     // === String table for symbols ===
     // seek_func(strtab_offset, SEEK_SET);
-    write_func(zeros, strtab_offset - cur_pos);
-    cur_pos = strtab_offset;
+    write_func(zeros, dynstr_offset - cur_pos);
+    cur_pos = dynstr_offset;
 
-    write_func(unified_strtab, strTabLen); cur_pos += strTabLen;
+    /* .dynstr */
+    write_func(dynstr, strTabLen); cur_pos += strTabLen;
     // PRINT_INFOF("libkallsyms: Count: %lu\n", count);
     // PRINT_INFOF("libkallsyms: names_size: %lu\n", names_size);
     // PRINT_INFOF("libkallsyms: strTabLen: %lu\n", strTabLen);
@@ -717,9 +830,15 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     PRINT_INFOF("libkallsyms: seeking dyn_offset\n");
     write_func(zeros, dyn_offset - cur_pos); cur_pos = dyn_offset;
     write_func(dyn_entries, sizeof(dyn_entries)); cur_pos += sizeof(dyn_entries);
+    /* .symtab (full) */
+    PRINT_INFOF("libkallsyms: seeking symtab_offset\n");
+    write_func(zeros, symtab_offset - cur_pos); cur_pos = symtab_offset;
+    write_func(merged_syms, sizeof(Elf64_Sym) * (total_syms + 1)); cur_pos += sizeof(Elf64_Sym) * (total_syms + 1);
+    /* .strtab */
+    PRINT_INFOF("libkallsyms: seeking strtab_offset\n");
+    write_func(zeros, strtab_offset - cur_pos); cur_pos = strtab_offset;
+    write_func(unified_strtab, strTabLen); cur_pos += strTabLen;
     
-
-
 
     // === Section header string table ===
     // Contains names of sections: ".text", ".symtab", ".strtab", ".shstrtab"
@@ -758,7 +877,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
 
     // .gnu.hash section
     Elf64_Shdr sh_gnu_hash = {0};
-    sh_gnu_hash.sh_name = 7; // ".gnu.hash"
+    sh_gnu_hash.sh_name = 7; // .gnu.hash
 #ifndef SHT_GNU_HASH
 #define SHT_GNU_HASH 0x6ffffff6
 #endif
@@ -768,27 +887,61 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     sh_gnu_hash.sh_offset = gnu_hash_offset;
     sh_gnu_hash.sh_size = gnu_hash_padded;
     sh_gnu_hash.sh_addralign = 8;
-    sh_gnu_hash.sh_link = 3; // link to .symtab index
+    sh_gnu_hash.sh_link = 3; // link to .dynsym index
     sh_gnu_hash.sh_info = 0;
     write_func(&sh_gnu_hash, sizeof(sh_gnu_hash));
     cur_pos += sizeof(sh_gnu_hash);
 
-    // .symtab section
+    // .dynsym section header
+    Elf64_Shdr sh_dynsym = {0};
+    sh_dynsym.sh_name = 17; // .dynsym
+    sh_dynsym.sh_type = SHT_DYNSYM;
+    sh_dynsym.sh_offset = dynsym_offset;
+    sh_dynsym.sh_size = sizeof(Elf64_Sym) * (total_syms + 1);
+    sh_dynsym.sh_link = 4; // link to .dynstr
+    sh_dynsym.sh_info = 1; // one local (NULL)
+    sh_dynsym.sh_addralign = 8;
+    sh_dynsym.sh_entsize = sizeof(Elf64_Sym);
+    write_func(&sh_dynsym, sizeof(sh_dynsym)); cur_pos += sizeof(sh_dynsym);
+
+    // .dynstr section header
+    Elf64_Shdr sh_dynstr = {0};
+    sh_dynstr.sh_name = 25; // .dynstr
+    sh_dynstr.sh_type = SHT_STRTAB;
+    sh_dynstr.sh_offset = dynstr_offset;
+    sh_dynstr.sh_size = strTabLen;
+    sh_dynstr.sh_addralign = 1;
+    write_func(&sh_dynstr, sizeof(sh_dynstr)); cur_pos += sizeof(sh_dynstr);
+
+    // .dynamic section
+    Elf64_Shdr sh_dynamic = {0};
+    sh_dynamic.sh_name = 33; // .dynamic
+    sh_dynamic.sh_type = SHT_DYNAMIC;
+    sh_dynamic.sh_flags = SHF_ALLOC;
+    sh_dynamic.sh_addr = 0;
+    sh_dynamic.sh_offset = dyn_offset;
+    sh_dynamic.sh_size = sizeof(dyn_entries);
+    sh_dynamic.sh_addralign = 8;
+    sh_dynamic.sh_entsize = sizeof(Elf64_Dyn);
+    sh_dynamic.sh_link = 4; // index of .dynstr
+    write_func(&sh_dynamic, sizeof(sh_dynamic));
+    cur_pos += sizeof(sh_dynamic);
+    // .symtab section header
     Elf64_Shdr sh_symtab = {0};
-    sh_symtab.sh_name = 17; // ".symtab"
+    sh_symtab.sh_name = 42; // .symtab
     sh_symtab.sh_type = SHT_SYMTAB;
     sh_symtab.sh_offset = symtab_offset;
     sh_symtab.sh_size = sizeof(Elf64_Sym) * (total_syms + 1);
-    sh_symtab.sh_link = 4; // .strtab index
-    sh_symtab.sh_info = 1; // One local symbol
+    sh_symtab.sh_link = 7; // index of .strtab
+    sh_symtab.sh_info = 1; // one local (NULL)
     sh_symtab.sh_addralign = 8;
     sh_symtab.sh_entsize = sizeof(Elf64_Sym);
     write_func(&sh_symtab, sizeof(sh_symtab));
     cur_pos += sizeof(sh_symtab);
 
-    // .strtab section
+    // .strtab section header
     Elf64_Shdr sh_strtab = {0};
-    sh_strtab.sh_name = 25; // ".strtab"
+    sh_strtab.sh_name = 50; // .strtab
     sh_strtab.sh_type = SHT_STRTAB;
     sh_strtab.sh_offset = strtab_offset;
     sh_strtab.sh_size = strTabLen;
@@ -798,7 +951,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
 
     // .shstrtab section
     Elf64_Shdr sh_shstrtab = {0};
-    sh_shstrtab.sh_name = 33; // ".shstrtab"
+    sh_shstrtab.sh_name = 58; // .shstrtab
     sh_shstrtab.sh_type = SHT_STRTAB;
     sh_shstrtab.sh_offset = shstrtab_offset;
     sh_shstrtab.sh_size = sizeof(shstrtab);
@@ -807,6 +960,8 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     cur_pos += sizeof(sh_shstrtab);
     PRINT_INFOF("libkallsyms: Wrote full ELF with .gnu.hash\n");
     if (gnu_hash_blob) FREE(gnu_hash_blob);
+    FREE(dynstr);
+    FREE(dynsym);
     FREE(unified_strtab);
     FREE(merged_syms);
     FREE(module_strtab_base_offset);
