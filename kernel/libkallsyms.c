@@ -62,19 +62,23 @@ static const char shstrtab[] =
     "\0.gnu.hash"
     "\0.dynsym"
     "\0.dynstr"
+    "\0.gnu.version"
+    "\0.gnu.version_d"
     "\0.dynamic"
     "\0.symtab"
     "\0.strtab"
     "\0.shstrtab\0";
-/* Offsets:
+/* Offsets (recomputed):
  *  .text=1
  *  .gnu.hash=7
  *  .dynsym=17
  *  .dynstr=25
- *  .dynamic=33
- *  .symtab=42
- *  .strtab=50
- *  .shstrtab=58
+ *  .gnu.version=33
+ *  .gnu.version_d=46
+ *  .dynamic=61
+ *  .symtab=70
+ *  .strtab=78
+ *  .shstrtab=86
  */
 
 /* External kallsyms data (attributes stripped for simplified build environment) */
@@ -232,6 +236,29 @@ static unsigned int gnu_hash_compute(const char *name) {
     }
     return h;
 }
+
+/* === GNU Symbol Versioning Support === */
+#ifndef SHT_GNU_verdef
+#define SHT_GNU_verdef 0x6ffffffd
+#endif
+#ifndef SHT_GNU_versym
+#define SHT_GNU_versym 0x6fffffff
+#endif
+#ifndef DT_VERSYM
+#define DT_VERSYM    0x6ffffff0
+#endif
+#ifndef DT_VERDEF
+#define DT_VERDEF    0x6ffffffc
+#endif
+#ifndef DT_VERDEFNUM
+#define DT_VERDEFNUM 0x6ffffffd
+#endif
+#ifndef VER_FLG_BASE
+#define VER_FLG_BASE 0x1
+#endif
+typedef struct { Elf64_Half vd_version, vd_flags, vd_ndx, vd_cnt; Elf64_Word vd_hash, vd_aux, vd_next; } lks_Elf64_Verdef;
+typedef struct { Elf64_Word vda_name, vda_next; } lks_Elf64_Verdaux;
+static unsigned int elf_sysv_hash(const unsigned char *name){ unsigned long h=0,g; while(*name){ h=(h<<4)+*name++; g=h&0xf0000000UL; if(g) h^=g>>24; h&=~g;} return (unsigned int)h; }
 
 /* Simple helper: next prime-ish number for small bucket counts.
  * For tiny symbol sets this avoids pathological clustering while
@@ -594,6 +621,14 @@ static unsigned long elfMaker_calcSize(lks_module_t *mods, unsigned int num_modu
         iter = (lks_module_t*)iter->next;
         i++;
     }
+    /* We now build a debug .strtab distinct from .dynstr. All symbol names
+     * in .strtab get "@ker" appended, while .dynstr remains original.
+     * Since we do a 1:1 copy of every symbol name (one per symbol) the
+     * additional size is 4 bytes ("@ker") per real symbol (NULL entry excluded).
+     * total_syms counts real symbols (excluding the implicit NULL we add later),
+     * so debugStrTabLen = strTabLen + 4 * total_syms.
+     * (If duplicates existed they'd have independent copies already.) */
+    unsigned long debugStrTabLen = strTabLen + (4UL * total_syms);
     /* Produce both runtime .dynsym and full .symtab/.strtab (debug) */
     unsigned long hashable = total_syms; // globals (symbol 0 is NULL)
     unsigned int nbuckets = 1;
@@ -612,17 +647,51 @@ static unsigned long elfMaker_calcSize(lks_module_t *mods, unsigned int num_modu
     const int text_offset = ALIGNMENT;
     const int dynsym_offset = text_offset + 0x100; /* keep gap */
     const int dynstr_offset = dynsym_offset + sizeof(Elf64_Sym) * (total_syms + 1);
-    const int gnu_hash_offset = dynstr_offset + strTabLen;
+    /* Pad dynstr to 8-byte alignment for gnu_hash_offset */
+    unsigned long dynstr_padded_len = strTabLen;
+    if (dynstr_padded_len & 7) dynstr_padded_len = (dynstr_padded_len + 7) & ~7UL;
+    const int gnu_hash_offset = dynstr_offset + dynstr_padded_len; /* dynstr only, 8-aligned */
     const int dyn_offset = gnu_hash_offset + gnu_hash_padded;
     const int symtab_offset = (dyn_offset + sizeof(Elf64_Dyn) * 5 + 16 + 7) & ~7; /* 8-align */
     const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
-    const int shstrtab_offset = strtab_offset + strTabLen;
+    const int shstrtab_offset = strtab_offset + debugStrTabLen;
     const int sh_offset = ((shstrtab_offset + sizeof(shstrtab))/ALIGNMENT + 1) * ALIGNMENT;
     const int file_size = sh_offset + sizeof(Elf64_Shdr) * 9; /* null + .text + .gnu.hash + .dynsym + .dynstr + .dynamic + .symtab + .strtab + .shstrtab */
     (void)type;
     return file_size;
 }
 
+
+/* Helper to append a string to both dynstr and unified_strtab, updating length
+ * and returning the starting offset via off_out. Returns 0 on success, -1 on failure. */
+static int lks_append_to_strtabs(char **pdynstr,
+                                 char **punified,
+                                 unsigned long *p_strTabLen,
+                                 const char *s,
+                                 size_t slen,
+                                 unsigned long *off_out)
+{
+    char *dyn = *pdynstr;
+    char *uni = *punified;
+    unsigned long old_len = *p_strTabLen;
+    char *new_dyn = vmalloc(old_len + slen);
+    char *new_uni = vmalloc(old_len + slen);
+    if (!new_dyn || !new_uni) {
+        PRINT_ERR("libkallsyms: version append alloc fail");
+        if (new_dyn) vfree(new_dyn);
+        if (new_uni) vfree(new_uni);
+        return -1;
+    }
+    memcpy(new_dyn, dyn, old_len);
+    memcpy(new_uni, uni, old_len);
+    memcpy(new_dyn + old_len, s, slen);
+    memcpy(new_uni + old_len, s, slen);
+    *off_out = old_len;
+    *p_strTabLen = old_len + slen;
+    vfree(dyn); *pdynstr = new_dyn;
+    FREE(uni);  *punified = new_uni;
+    return 0;
+}
 
 static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_modules,
     unsigned long (*write_func)(const void *, unsigned long)) {
@@ -643,7 +712,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
         if (iter->strtab && iter->strtab_size > 0) strTabLen += iter->strtab_size;
         iter = (lks_module_t*)iter->next; i++; }
 
-    /* Build merged symbol table + unified strtab (used by both .dynsym/.dynstr only) */
+    /* Build merged symbol table + unified strtab (this becomes .dynstr only) */
     Elf64_Sym *merged_syms = (Elf64_Sym*)MALLOC(sizeof(Elf64_Sym) * (total_syms + 1));
     if (!merged_syms) { PRINT_ERR("libkallsyms: merged_syms alloc failed"); return -1; }
     memset(merged_syms, 0, sizeof(Elf64_Sym) * (total_syms + 1));
@@ -677,22 +746,112 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     if (!dynstr) { PRINT_ERR("libkallsyms: dynstr alloc failed"); FREE(dynsym); FREE(module_strtab_base_offset); FREE(unified_strtab); FREE(merged_syms); return -1; }
     memcpy(dynstr, unified_strtab, strTabLen);
 
-    /* Build .gnu.hash against dynsym */
-    unsigned char *gnu_hash_blob = NULL; unsigned long gnu_hash_size = 0;
-    if (build_gnu_hash_section(dynsym, total_syms + 1, dynstr, 1, &gnu_hash_blob, &gnu_hash_size) != 0) {
-        PRINT_ERR("libkallsyms: build_gnu_hash_section failed"); gnu_hash_size = 0; }
+    /* Ensure both base version name and secondary version name exist in dynstr/unified */
+    const char *base_name = "libkallsyms.so"; size_t base_name_len = strlen(base_name) + 1; unsigned long base_name_off = 0;
+    const char *version_name = "ker";           size_t version_name_len = strlen(version_name) + 1; unsigned long version_name_off = 0;
+    /* helper to find string offset */
+    unsigned long scan = 0;
+    while (scan < strTabLen) { size_t l = strlen(&dynstr[scan]); if (l==0){ scan++; continue;} if (!base_name_off && strcmp(&dynstr[scan], base_name)==0) base_name_off = scan; if (!version_name_off && strcmp(&dynstr[scan], version_name)==0) version_name_off = scan; if (base_name_off && version_name_off) break; scan += l + 1; }
+    if (!base_name_off) {
+        if (lks_append_to_strtabs(&dynstr, &unified_strtab, &strTabLen,
+                                  base_name, base_name_len, &base_name_off) != 0) {
+            FREE(dynsym); FREE(module_strtab_base_offset); vfree(dynstr); FREE(unified_strtab); FREE(merged_syms); return -1;
+        }
+    }
+    if (!version_name_off) {
+        if (lks_append_to_strtabs(&dynstr, &unified_strtab, &strTabLen,
+                                  version_name, version_name_len, &version_name_off) != 0) {
+            FREE(dynsym); FREE(module_strtab_base_offset); vfree(dynstr); FREE(unified_strtab); FREE(merged_syms); return -1;
+        }
+    }
+    /* Build .gnu.hash against updated dynstr */
+    unsigned char *gnu_hash_blob = NULL; unsigned long gnu_hash_size = 0; if (build_gnu_hash_section(dynsym, total_syms + 1, dynstr, 1, &gnu_hash_blob, &gnu_hash_size) != 0) { PRINT_ERR("libkallsyms: build_gnu_hash_section failed"); gnu_hash_size = 0; }
     unsigned long gnu_hash_padded = (gnu_hash_size + 7) & ~((unsigned long)7);
+    /* versym table */
+    unsigned long versym_count = total_syms + 1; unsigned long versym_size = versym_count * sizeof(Elf64_Half); Elf64_Half *versym = vmalloc(versym_size); if(!versym){ PRINT_ERR("libkallsyms: versym alloc fail"); if(gnu_hash_blob)vfree(gnu_hash_blob); FREE(dynsym); FREE(module_strtab_base_offset); vfree(dynstr); FREE(unified_strtab); FREE(merged_syms); return -1;} versym[0]=0; unsigned long sidx; for(sidx=1;sidx<versym_count;++sidx) versym[sidx]=2; /* version index 2 */
+    /* verdef blob */
+    lks_Elf64_Verdef verdef1={0}, verdef2={0}; lks_Elf64_Verdaux aux1={0}, aux2={0};
+    unsigned int base_hash = elf_sysv_hash((const unsigned char*)base_name);
+    unsigned int ker_hash  = elf_sysv_hash((const unsigned char*)version_name);
+    /* BASE node (index 1) named after the file */
+    verdef1.vd_version=1; verdef1.vd_flags=VER_FLG_BASE; verdef1.vd_ndx=1; verdef1.vd_cnt=1; verdef1.vd_hash=base_hash; verdef1.vd_aux=sizeof(lks_Elf64_Verdef); verdef1.vd_next=sizeof(lks_Elf64_Verdef)+sizeof(lks_Elf64_Verdaux);
+    aux1.vda_name=base_name_off; aux1.vda_next=0;
+    /* Second node (index 2) named 'ker' */
+    verdef2.vd_version=1; verdef2.vd_flags=0; verdef2.vd_ndx=2; verdef2.vd_cnt=1; verdef2.vd_hash=ker_hash; verdef2.vd_aux=sizeof(lks_Elf64_Verdef); verdef2.vd_next=0;
+    aux2.vda_name=version_name_off; aux2.vda_next=0;
+    unsigned long verdef_size=(sizeof(lks_Elf64_Verdef)+sizeof(lks_Elf64_Verdaux))*2; unsigned char *verdef_blob=vmalloc(verdef_size); if(!verdef_blob){ PRINT_ERR("libkallsyms: verdef alloc fail"); if(gnu_hash_blob)vfree(gnu_hash_blob); vfree(versym); FREE(dynsym); FREE(module_strtab_base_offset); vfree(dynstr); FREE(unified_strtab); FREE(merged_syms); return -1;} unsigned char *vptr=verdef_blob; memcpy(vptr,&verdef1,sizeof(verdef1)); vptr+=sizeof(verdef1); memcpy(vptr,&aux1,sizeof(aux1)); vptr+=sizeof(aux1); memcpy(vptr,&verdef2,sizeof(verdef2)); vptr+=sizeof(verdef2); memcpy(vptr,&aux2,sizeof(aux2));
 
-    /* Layout */
+    /* Layout with version sections */
     const int ph_offset = sizeof(Elf64_Ehdr);
     const int text_offset = ALIGNMENT;
     const int dynsym_offset = text_offset + 0x100;
     const int dynstr_offset = dynsym_offset + sizeof(Elf64_Sym) * (total_syms + 1);
-    const int gnu_hash_offset = dynstr_offset + strTabLen;
-    const int dyn_offset = gnu_hash_offset + gnu_hash_padded;
-    const int symtab_offset = (dyn_offset + sizeof(Elf64_Dyn)*5 + 16 + 7) & ~7; /* 8-align */
+    
+    unsigned long dynstr_padded_len = strTabLen;
+    if (dynstr_padded_len & 7) dynstr_padded_len = (dynstr_padded_len + 7) & ~7UL;
+    const int gnu_hash_offset = dynstr_offset + dynstr_padded_len; /* dynstr only, 8-aligned */
+    
+    const int versym_offset = gnu_hash_offset + gnu_hash_padded;
+    const int verdef_offset = (versym_offset + versym_size + 7) & ~7;
+    const int dyn_offset = (verdef_offset + verdef_size + 7) & ~7;
+    /* Build separate debug .strtab with "@ker" appended to every symbol name */
+    unsigned long debugStrExtraPerName = 4; /* length of "@ker" */
+    unsigned long debugStrEst = strTabLen + debugStrExtraPerName * total_syms; /* estimation (exact below) */
+    char *debug_strtab = vmalloc(debugStrEst ? debugStrEst : 1);
+    if (!debug_strtab) { PRINT_ERR("libkallsyms: debug_strtab alloc fail"); if(gnu_hash_blob)vfree(gnu_hash_blob); vfree(versym); vfree(verdef_blob); FREE(dynsym); FREE(module_strtab_base_offset); vfree(dynstr); FREE(unified_strtab); FREE(merged_syms); return -1; }
+    unsigned long *offset_map = vmalloc(strTabLen * sizeof(unsigned long));
+    if (!offset_map) { PRINT_ERR("libkallsyms: offset_map alloc fail"); vfree(debug_strtab); if(gnu_hash_blob)vfree(gnu_hash_blob); vfree(versym); vfree(verdef_blob); FREE(dynsym); FREE(module_strtab_base_offset); vfree(dynstr); FREE(unified_strtab); FREE(merged_syms); return -1; }
+    unsigned long orig_off = 0, new_off = 0; /* iterate through dynstr to build debug_strtab */
+    while (orig_off < strTabLen) {
+        const char *s = &unified_strtab[orig_off];
+        size_t len = strlen(s);
+        offset_map[orig_off] = new_off; /* record mapping */
+        if (len == 0) { /* leading empty string */
+            if (new_off >= debugStrEst) { /* expand */
+                char *tmp = vmalloc(debugStrEst + 16);
+                if (!tmp) { PRINT_ERR("libkallsyms: debug_strtab grow fail (empty) "); goto debug_strtab_fail; }
+                memcpy(tmp, debug_strtab, new_off);
+                vfree(debug_strtab); debug_strtab = tmp; debugStrEst += 16;
+            }
+            debug_strtab[new_off++] = '\0';
+        } else {
+            /* ensure capacity */
+            unsigned long need = len + 4 + 1; /* original + "@ker" + nul */
+            if (new_off + need > debugStrEst) {
+                unsigned long grow = debugStrEst;
+                if (grow < need) grow = need;
+                char *tmp = vmalloc(debugStrEst + grow);
+                if (!tmp) { PRINT_ERR("libkallsyms: debug_strtab grow fail"); goto debug_strtab_fail; }
+                memcpy(tmp, debug_strtab, new_off);
+                vfree(debug_strtab); debug_strtab = tmp; debugStrEst += grow;
+            }
+            memcpy(&debug_strtab[new_off], s, len);
+            new_off += len;
+            memcpy(&debug_strtab[new_off], "@ker", 4);
+            new_off += 4;
+            debug_strtab[new_off++]='\0';
+        }
+        orig_off += len + 1;
+    }
+    unsigned long debugStrTabLen = new_off; /* final size */
+    /* Create symtab copy with adjusted name offsets */
+    Elf64_Sym *symtab_syms = (Elf64_Sym*)MALLOC(sizeof(Elf64_Sym)*(total_syms+1));
+    if (!symtab_syms) { PRINT_ERR("libkallsyms: symtab_syms alloc fail"); goto debug_strtab_fail; }
+    memcpy(symtab_syms, merged_syms, sizeof(Elf64_Sym)*(total_syms+1));
+    for (sidx=1; sidx < total_syms + 1; ++sidx) {
+        unsigned long orig_name_off = merged_syms[sidx].st_name;
+        if (orig_name_off < strTabLen) {
+            symtab_syms[sidx].st_name = offset_map[orig_name_off];
+        } else {
+            PRINT_ERR("libkallsyms: st_name out of range when remapping");
+            symtab_syms[sidx].st_name = 0;
+        }
+    }
+
+    /* Now compute layout with separate debug .strtab */
+    const int symtab_offset = (dyn_offset + sizeof(Elf64_Dyn)*8 + 7) & ~7; /* 8-align after dynamic */
     const int strtab_offset = symtab_offset + sizeof(Elf64_Sym) * (total_syms + 1);
-    const int shstrtab_offset = strtab_offset + strTabLen;
+    const int shstrtab_offset = strtab_offset + debugStrTabLen;
     const int sh_offset = ((shstrtab_offset + sizeof(shstrtab))/ALIGNMENT + 1) * ALIGNMENT;
 
     PRINT_INFOF("libkallsyms: ELF layout with .gnu.hash:\n");
@@ -702,9 +861,11 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     PRINT_INFOF("  .dynsym:           0x%lx - 0x%lx\n", (unsigned long)dynsym_offset, (unsigned long)dynstr_offset);
     PRINT_INFOF("  .dynstr:           0x%lx - 0x%lx\n", (unsigned long)dynstr_offset, (unsigned long)gnu_hash_offset);
     PRINT_INFOF("  .gnu.hash:         0x%lx - 0x%lx (size=%lu)\n", (unsigned long)gnu_hash_offset, (unsigned long)(gnu_hash_offset+gnu_hash_padded), gnu_hash_size);
+    PRINT_INFOF("  .gnu.version:      0x%lx - 0x%lx (size=%lu)\n", (unsigned long)versym_offset, (unsigned long)(versym_offset+versym_size), versym_size);
+    PRINT_INFOF("  .gnu.version_d:    0x%lx - 0x%lx (size=%lu)\n", (unsigned long)verdef_offset, (unsigned long)(verdef_offset+verdef_size), verdef_size);
     PRINT_INFOF("  .dynamic:          0x%lx - 0x%lx\n", (unsigned long)dyn_offset, (unsigned long)symtab_offset);
     PRINT_INFOF("  .symtab:           0x%lx - 0x%lx\n", (unsigned long)symtab_offset, (unsigned long)strtab_offset);
-    PRINT_INFOF("  .strtab:           0x%lx - 0x%lx\n", (unsigned long)strtab_offset, (unsigned long)shstrtab_offset);
+    PRINT_INFOF("  .strtab:           0x%lx - 0x%lx (size=%lu)\n", (unsigned long)strtab_offset, (unsigned long)shstrtab_offset, (unsigned long)debugStrTabLen);
     PRINT_INFOF("  .shstrtab:         0x%lx - 0x%lx\n", (unsigned long)shstrtab_offset, (unsigned long)sh_offset);
     PRINT_INFOF("  Section headers:   0x%lx\n", (unsigned long)sh_offset);
 
@@ -716,8 +877,11 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     Elf64_Dyn dyn_entries[] = {
         { DT_SYMTAB, dynsym_offset },
         { DT_STRTAB, dynstr_offset },
-        { DT_STRSZ,  strTabLen },
+        { DT_STRSZ,  strTabLen }, /* size of .dynstr only */
         { DT_GNU_HASH, gnu_hash_offset },
+        { DT_VERSYM, versym_offset },
+        { DT_VERDEF, verdef_offset },
+        { DT_VERDEFNUM, 2 },
         { DT_NULL, 0 }
     };
 
@@ -743,8 +907,8 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
         ehdr.e_phnum = 1; // Only text and dynamic
     }
     ehdr.e_shentsize = sizeof(Elf64_Shdr);
-    ehdr.e_shnum = 9; // null + .text + .gnu.hash + .dynsym + .dynstr + .dynamic + .symtab + .strtab + .shstrtab
-    ehdr.e_shstrndx = 8; // index of .shstrtab
+    ehdr.e_shnum = 11; // add .gnu.version + .gnu.version_d
+    ehdr.e_shstrndx = 10; // new index of .shstrtab
 
     PRINT_INFOF("libkallsyms: writing ELF header, size: %d\n", sizeof(ehdr));
     write_func(&ehdr, sizeof(ehdr));
@@ -811,7 +975,12 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     cur_pos = dynstr_offset;
 
     /* .dynstr */
-    write_func(dynstr, strTabLen); cur_pos += strTabLen;
+    write_func(dynstr, strTabLen);
+    if (dynstr_padded_len > strTabLen) {
+        char pad[8] = {0};
+        write_func(pad, dynstr_padded_len - strTabLen);
+    }
+    cur_pos += dynstr_padded_len;
     // PRINT_INFOF("libkallsyms: Count: %lu\n", count);
     // PRINT_INFOF("libkallsyms: names_size: %lu\n", names_size);
     // PRINT_INFOF("libkallsyms: strTabLen: %lu\n", strTabLen);
@@ -823,9 +992,18 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     write_func(zeros, gnu_hash_offset - cur_pos); cur_pos = gnu_hash_offset;
     if (gnu_hash_size) {
         write_func(gnu_hash_blob, gnu_hash_size);
-        if (gnu_hash_padded - gnu_hash_size) write_func(zeros, gnu_hash_padded - gnu_hash_size);
+        if (gnu_hash_padded > gnu_hash_size) 
+            write_func(zeros, gnu_hash_padded - gnu_hash_size);
     }
     cur_pos += gnu_hash_padded;
+    /* .gnu.version */
+    write_func(zeros, versym_offset - cur_pos); 
+    cur_pos = versym_offset; 
+    write_func(versym, versym_size); 
+    cur_pos += versym_size; 
+    if (versym_size & 7){ unsigned long pad=8-(versym_size&7); write_func(zeros,pad); cur_pos+=pad; }
+    /* .gnu.version_d */
+    write_func(zeros, verdef_offset - cur_pos); cur_pos = verdef_offset; write_func(verdef_blob, verdef_size); cur_pos += verdef_size; if (verdef_size & 7){ unsigned long pad=8-(verdef_size&7); write_func(zeros,pad); cur_pos+=pad; }
 
     PRINT_INFOF("libkallsyms: seeking dyn_offset\n");
     write_func(zeros, dyn_offset - cur_pos); cur_pos = dyn_offset;
@@ -833,11 +1011,11 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     /* .symtab (full) */
     PRINT_INFOF("libkallsyms: seeking symtab_offset\n");
     write_func(zeros, symtab_offset - cur_pos); cur_pos = symtab_offset;
-    write_func(merged_syms, sizeof(Elf64_Sym) * (total_syms + 1)); cur_pos += sizeof(Elf64_Sym) * (total_syms + 1);
+    write_func(symtab_syms, sizeof(Elf64_Sym) * (total_syms + 1)); cur_pos += sizeof(Elf64_Sym) * (total_syms + 1);
     /* .strtab */
     PRINT_INFOF("libkallsyms: seeking strtab_offset\n");
     write_func(zeros, strtab_offset - cur_pos); cur_pos = strtab_offset;
-    write_func(unified_strtab, strTabLen); cur_pos += strTabLen;
+    write_func(debug_strtab, debugStrTabLen); cur_pos += debugStrTabLen;
     
 
     // === Section header string table ===
@@ -909,13 +1087,24 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     sh_dynstr.sh_name = 25; // .dynstr
     sh_dynstr.sh_type = SHT_STRTAB;
     sh_dynstr.sh_offset = dynstr_offset;
-    sh_dynstr.sh_size = strTabLen;
+    sh_dynstr.sh_size = dynstr_padded_len;
     sh_dynstr.sh_addralign = 1;
     write_func(&sh_dynstr, sizeof(sh_dynstr)); cur_pos += sizeof(sh_dynstr);
 
+    // .gnu.version section header
+    Elf64_Shdr sh_versym = {0};
+    sh_versym.sh_name = 33; /* .gnu.version */
+    sh_versym.sh_type = SHT_GNU_versym; sh_versym.sh_flags = SHF_ALLOC;
+    sh_versym.sh_offset = versym_offset; sh_versym.sh_size = versym_size; sh_versym.sh_link = 3; sh_versym.sh_addralign = 2; sh_versym.sh_entsize = sizeof(Elf64_Half);
+    write_func(&sh_versym, sizeof(sh_versym)); cur_pos += sizeof(sh_versym);
+    // .gnu.version_d section header
+    Elf64_Shdr sh_verdef = {0};
+    sh_verdef.sh_name = 46; /* .gnu.version_d */
+    sh_verdef.sh_type = SHT_GNU_verdef; sh_verdef.sh_flags = SHF_ALLOC; sh_verdef.sh_offset = verdef_offset; sh_verdef.sh_size = verdef_size; sh_verdef.sh_link = 4; sh_verdef.sh_info = 2; sh_verdef.sh_addralign = 8;
+    write_func(&sh_verdef, sizeof(sh_verdef)); cur_pos += sizeof(sh_verdef);
     // .dynamic section
     Elf64_Shdr sh_dynamic = {0};
-    sh_dynamic.sh_name = 33; // .dynamic
+    sh_dynamic.sh_name = 61; // .dynamic (new offset)
     sh_dynamic.sh_type = SHT_DYNAMIC;
     sh_dynamic.sh_flags = SHF_ALLOC;
     sh_dynamic.sh_addr = 0;
@@ -928,11 +1117,11 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     cur_pos += sizeof(sh_dynamic);
     // .symtab section header
     Elf64_Shdr sh_symtab = {0};
-    sh_symtab.sh_name = 42; // .symtab
+    sh_symtab.sh_name = 70; // .symtab
     sh_symtab.sh_type = SHT_SYMTAB;
     sh_symtab.sh_offset = symtab_offset;
     sh_symtab.sh_size = sizeof(Elf64_Sym) * (total_syms + 1);
-    sh_symtab.sh_link = 7; // index of .strtab
+    sh_symtab.sh_link = 9; // index of .strtab
     sh_symtab.sh_info = 1; // one local (NULL)
     sh_symtab.sh_addralign = 8;
     sh_symtab.sh_entsize = sizeof(Elf64_Sym);
@@ -941,17 +1130,17 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
 
     // .strtab section header
     Elf64_Shdr sh_strtab = {0};
-    sh_strtab.sh_name = 50; // .strtab
+    sh_strtab.sh_name = 78; // .strtab
     sh_strtab.sh_type = SHT_STRTAB;
     sh_strtab.sh_offset = strtab_offset;
-    sh_strtab.sh_size = strTabLen;
+    sh_strtab.sh_size = debugStrTabLen;
     sh_strtab.sh_addralign = 1;
     write_func(&sh_strtab, sizeof(sh_strtab));
     cur_pos += sizeof(sh_strtab);
 
     // .shstrtab section
     Elf64_Shdr sh_shstrtab = {0};
-    sh_shstrtab.sh_name = 58; // .shstrtab
+    sh_shstrtab.sh_name = 86; // .shstrtab
     sh_shstrtab.sh_type = SHT_STRTAB;
     sh_shstrtab.sh_offset = shstrtab_offset;
     sh_shstrtab.sh_size = sizeof(shstrtab);
@@ -959,13 +1148,31 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     write_func(&sh_shstrtab, sizeof(sh_shstrtab));
     cur_pos += sizeof(sh_shstrtab);
     PRINT_INFOF("libkallsyms: Wrote full ELF with .gnu.hash\n");
-    if (gnu_hash_blob) FREE(gnu_hash_blob);
-    FREE(dynstr);
+    if (gnu_hash_blob) vfree(gnu_hash_blob);
+    if (versym) vfree(versym);
+    if (verdef_blob) vfree(verdef_blob);
+    vfree(dynstr);
     FREE(dynsym);
+    vfree(debug_strtab);
+    vfree(offset_map);
+    FREE(symtab_syms);
     FREE(unified_strtab);
     FREE(merged_syms);
     FREE(module_strtab_base_offset);
     return 0;
+
+debug_strtab_fail:
+    if (offset_map) vfree(offset_map);
+    if (debug_strtab) vfree(debug_strtab);
+    if (gnu_hash_blob) vfree(gnu_hash_blob);
+    if (versym) vfree(versym);
+    if (verdef_blob) vfree(verdef_blob);
+    vfree(dynstr);
+    FREE(dynsym);
+    FREE(unified_strtab);
+    FREE(merged_syms);
+    FREE(module_strtab_base_offset);
+    return -1;
 }
 
 
