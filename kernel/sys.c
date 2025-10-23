@@ -80,6 +80,8 @@
 
 #include "uid16.h"
 
+#include <linux/symbiote_hook.h>
+
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
 #endif
