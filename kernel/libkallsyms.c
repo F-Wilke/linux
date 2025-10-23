@@ -44,6 +44,9 @@
 
 #define ELF32_ST_INFO(bind, type)	(((bind) << 4) + ((type) & 0xf))
 #define ELF64_ST_INFO(bind, type)	ELF32_ST_INFO ((bind), (type))
+#ifndef ELF64_ST_VISIBILITY
+#define ELF64_ST_VISIBILITY(o)	((o) & 0x03)
+#endif
 
 // In-memory representation of a symbol provider (kernel or module).
 // strtab must start with a leading '\0'. st_name fields are OFFSETS.
@@ -921,6 +924,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     const int ph_offset = sizeof(Elf64_Ehdr);
     const int text_offset = ALIGNMENT;
     const int dynsym_offset = text_offset + 0x100;
+    const unsigned int dynsym_symoffset = 1; /* index of first global symbol (after NULL local) */
     const int dynstr_offset = dynsym_offset + sizeof(Elf64_Sym) * (total_syms + 1);
     
     unsigned long dynstr_padded_len = strTabLen;
@@ -1204,7 +1208,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
     sh_dynsym.sh_offset = dynsym_offset;
     sh_dynsym.sh_size = sizeof(Elf64_Sym) * (total_syms + 1);
     sh_dynsym.sh_link = 4; // link to .dynstr
-    sh_dynsym.sh_info = 1; // one local (NULL)
+    sh_dynsym.sh_info = dynsym_symoffset; // index of first global symbol (last local + 1)
     sh_dynsym.sh_addralign = 8;
     sh_dynsym.sh_entsize = sizeof(Elf64_Sym);
     write_func(&sh_dynsym, sizeof(sh_dynsym)); cur_pos += sizeof(sh_dynsym);
@@ -1592,7 +1596,8 @@ static int lks_module_notify(struct notifier_block *nb, unsigned long op,
                 /* First pass: count and total string length */
                 unsigned int pub_count = 0; /* not including index 0 */
                 unsigned long str_total = 1; /* leading NUL */
-                for (unsigned int s = 1; s < orig_n; ++s) {
+                unsigned int s;
+                for (s = 1; s < orig_n; ++s) {
                     unsigned char bind = ELF64_ST_BIND(orig_sym[s].st_info);
                     unsigned char type = ELF64_ST_TYPE(orig_sym[s].st_info);
                     unsigned char vis  = ELF64_ST_VISIBILITY(orig_sym[s].st_other);
@@ -1628,7 +1633,7 @@ static int lks_module_notify(struct notifier_block *nb, unsigned long op,
 
                 /* Second pass: copy filtered symbols and names */
                 unsigned int out_idx = 1;
-                for (unsigned int s = 1; s < orig_n; ++s) {
+                for (s = 1; s < orig_n; ++s) {
                     unsigned char bind = ELF64_ST_BIND(orig_sym[s].st_info);
                     unsigned char type = ELF64_ST_TYPE(orig_sym[s].st_info);
                     unsigned char vis  = ELF64_ST_VISIBILITY(orig_sym[s].st_other);
@@ -1643,6 +1648,7 @@ static int lks_module_notify(struct notifier_block *nb, unsigned long op,
                         /* Copy symbol and rewrite st_name */
                         new_sym[out_idx] = orig_sym[s];
                         new_sym[out_idx].st_name = (Elf64_Word)woff;
+                        new_sym[out_idx].st_shndx = SHN_ABS; //mark as absolute to not confuse the runtime loader
                         size_t nlen = strlen(name) + 1;
                         memcpy(new_str + woff, name, nlen);
                         woff += nlen;
