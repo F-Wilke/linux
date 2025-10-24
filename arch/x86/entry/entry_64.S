@@ -140,16 +140,6 @@ SYM_INNER_LABEL(entry_SYSCALL_64_after_hwframe, SYM_L_GLOBAL)
 	jnz	symbi_swapgs_restore_regs_and_return_to_usermode_ret
 #endif
 
-#ifdef CONFIG_SYMBIOTE
-  /* Check elevation status. */
-	pushq	%rax
-	call	symbi_check_elevate
-	testb	$0x1, %al
-	popq	%rax
-	/* jnz	symbi_swapgs_restore_regs_and_return_to_usermode_iret */
-	jnz	symbi_swapgs_restore_regs_and_return_to_usermode_ret
-#endif
-
 	movq	RCX(%rsp), %rcx
 	movq	RIP(%rsp), %r11
 
