@@ -126,10 +126,6 @@ SYM_INNER_LABEL(entry_SYSCALL_64_after_hwframe, SYM_L_GLOBAL)
 	 * go to the slow exit path.
 	 * In the Xen PV case we must use iret anyway.
 	 */
-
-	ALTERNATIVE "testb %al, %al; jz swapgs_restore_regs_and_return_to_usermode", \
-		"jmp swapgs_restore_regs_and_return_to_usermode", X86_FEATURE_XENPV
-
 #ifdef CONFIG_SYMBIOTE
 	pushq	%rax
 	call	symbi_check_elevate
@@ -137,6 +133,10 @@ SYM_INNER_LABEL(entry_SYSCALL_64_after_hwframe, SYM_L_GLOBAL)
 	popq	%rax
 	jnz	symbi_return_to_usermode
 #endif
+
+	ALTERNATIVE "testb %al, %al; jz swapgs_restore_regs_and_return_to_usermode", \
+		"jmp swapgs_restore_regs_and_return_to_usermode", X86_FEATURE_XENPV
+
 
 	/*
 	 * We win! This label is here just for ease of understanding
@@ -745,8 +745,17 @@ native_irq_return_ldt:
 #endif
 
 SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
-	STACKLEAK_ERASE
 
+
+	movq	RIP(%rsp), %r15 /* return address in r15 */
+	movq	RSP(%rsp), %r14	 /* user stack in r14 */
+	subq	$0x10, %r14 //we make room for two qwords
+	movq	%r15, 8(%r14) //this will be used in retq
+	movq	EFLAGS(%rsp), %r15 /* EFLAGS in r15 */
+	movq	%r15, (%r14) //this will be used in popfq
+	movq	%r14, RSP(%rsp)
+
+	STACKLEAK_ERASE
 	POP_REGS pop_rdi=0
 
 	/*
@@ -773,9 +782,8 @@ SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
 	 */
 	STACKLEAK_ERASE_NOCLOBBER
 
-	push	%rax
-	SWITCH_TO_USER_CR3 scratch_reg=%rdi scratch_reg2=%rax
-	pop	%rax
+	//caution! SWITCH_TO_USER_CR3 does not depend on X86_FEATURE_PTI
+	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi 
 
 	/* Restore RDI. */
 	popq	%rdi
