@@ -540,7 +540,7 @@ static unsigned char GetElfTypeForSymType(char type) {
 
 // Build a single lks_module_t from (kernel) symbol data.
 static lks_module_t* make_lks_mod(char* nameTypes, unsigned long first_address_id, unsigned int num_syms,
-    unsigned long names_size, unsigned long first_name_pos,
+    unsigned long names_size, unsigned long first_name_pos, unsigned char only_globals,
     unsigned int (*decompress_func)(unsigned int off, char *result, unsigned long maxlen)) {
     if (!nameTypes || !decompress_func || num_syms == 0) {
         PRINT_ERR("libkallsyms: make_lks_mod invalid args");
@@ -563,10 +563,26 @@ static lks_module_t* make_lks_mod(char* nameTypes, unsigned long first_address_i
 
     unsigned int off = first_name_pos;
     char symBuffer[MAX_SYM_LEN];
-    unsigned int i;
-    for (i = 0; i < num_syms; i++) {
+    unsigned int i, target_i;
+    unsigned long len;
+
+    i = 0;//i is the index in the source array containing all symbols
+    for (target_i = 0; target_i < num_syms; target_i++) {
+        
         off = decompress_func(off, symBuffer, MAX_SYM_LEN);
-        unsigned long len = (unsigned long)strlen(symBuffer);
+        len = (unsigned long)strlen(symBuffer);
+        
+        if (only_globals) {
+            unsigned char t = nameTypes[i];
+            //go over non global symbols
+            while (t >= 'a' && t <= 'z')
+            {
+                i++;
+                t = nameTypes[i];
+                off = decompress_func(off, symBuffer, MAX_SYM_LEN);
+                len = (unsigned long)strlen(symBuffer);
+            }
+        }
 
         if (str_off + len + 1 > names_size) { // +1 for future safety
             PRINT_ERR("libkallsyms: strtab overflow in make_lks_mod");
@@ -576,7 +592,7 @@ static lks_module_t* make_lks_mod(char* nameTypes, unsigned long first_address_i
         memcpy(&strtab[str_off], symBuffer, len);
         strtab[str_off + len] = '\0';
 
-        Elf64_Sym *s = &symtab[i];
+        Elf64_Sym *s = &symtab[target_i];
         s->st_name = str_off; // offset into strtab
         s->st_info = GetElfTypeForSymType(nameTypes[i]);
         s->st_other = STV_DEFAULT;
@@ -590,9 +606,10 @@ static lks_module_t* make_lks_mod(char* nameTypes, unsigned long first_address_i
         s->st_size = sizeof(void*);
 
         if (!(i % 100)) {
-            PRINT_INFOF("libkallsyms: make_lks_mod sym %u name=%s type=%c addr=%lx\n", i, &strtab[str_off], nameTypes[i], s->st_value);
+            PRINT_INFOF("libkallsyms: make_lks_mod sym %u name=%s type=%c addr=%lx, target_i: %u\n", i, &strtab[str_off], nameTypes[i], s->st_value, target_i);
         }
         str_off += len + 1;
+        i++;
     }
 
     lks_module_t *m = (lks_module_t*)MALLOC(sizeof(lks_module_t));
@@ -1771,11 +1788,15 @@ static int __init libkallsyms_init_syms(void) {
 
     // pos = &kallsyms_names[0];
     kallsyms_names_size = 0;
+    unsigned long kallsyms_local_symbols = 0;
 
 
     for (i = 0, pos = 0; i < kallsyms_num_syms; i++) {
         
         kallsyms_name_types[i] = kallsyms_get_symbol_type(pos);
+
+        if (kallsyms_name_types[i] >= 'a' && kallsyms_name_types[i] <= 'z')
+            kallsyms_local_symbols++;
 
         pos = kallsyms_expand_symbol(pos, symBuffer, MAX_SYM_LEN);
 
@@ -1825,9 +1846,10 @@ static int __init libkallsyms_init_syms(void) {
     modules_head = make_lks_mod(
         kallsyms_name_types, //char* nameTypes,
         0, //unsigned long first_address_id,
-        kallsyms_num_syms, //unsigned int num_syms
+        kallsyms_num_syms - kallsyms_local_symbols, //unsigned int num_syms
         kallsyms_names_size + kallsyms_per_cpu_names_size, //unsigned long names_size,
         0, //unsigned long first_name_pos,
+        1, //unsigned char only_globals,
         &kallsyms_expand_symbol //unsigned int (*decompress_func)(unsigned int off, char *result, size_t maxlen)
     ); 
 
@@ -1851,13 +1873,13 @@ static int __init libkallsyms_init_syms(void) {
     pr_info("%s: proc fs entries created correctly (.so size=%lu, .a size=%lu)\n", MODULE_NAME, file_size_dyn, file_size_rel);
 
     //register module notifier
-    int ret;
-    ret = register_module_notifier(&nb);
-    if (ret) {
-        pr_alert("%s: failed to register module notifier\n", MODULE_NAME);
-        return ret;
-    }
-    pr_info("%s: module notifier registered\n", MODULE_NAME);
+    // int ret;
+    // ret = register_module_notifier(&nb);
+    // if (ret) {
+    //     pr_alert("%s: failed to register module notifier\n", MODULE_NAME);
+    //     return ret;
+    // }
+    // pr_info("%s: module notifier registered\n", MODULE_NAME);
 
     return 0;
     

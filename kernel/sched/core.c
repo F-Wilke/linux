@@ -2515,14 +2515,13 @@ static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 	activate_task(rq, p, 0);
 	wakeup_preempt(rq, p, 0);
 
-#if 0
+
 #ifdef CONFIG_SYMBIOTE
 	// Indicate that a symbiote thread has migrated cores in order
 	// to properly "fix" the gsbase value in context_switch() call.
     if (p->symbiote_elevated) {
 		p->symbiote_migrated = 1;
 	}
-#endif
 #endif
 
 	return rq;
@@ -5358,7 +5357,7 @@ static __always_inline struct rq *
 context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next, struct rq_flags *rf)
 {
-#if 0
+
 #ifdef CONFIG_SYMBIOTE
 	// When symbiote threads are migrating to another core
 	// they require their gsbase to be updated to that of
@@ -5391,7 +5390,6 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		// Indicate that the migration has been handled
 		next->symbiote_migrated = 0;
 	}
-#endif
 #endif
 
 	prepare_task_switch(rq, prev, next);
