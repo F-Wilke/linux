@@ -3746,8 +3746,17 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 #ifdef CONFIG_SMP
 	if (wake_flags & WF_RQ_SELECTED)
 		en_flags |= ENQUEUE_RQ_SELECTED;
-	if (wake_flags & WF_MIGRATED)
+	if (wake_flags & WF_MIGRATED) {
 		en_flags |= ENQUEUE_MIGRATED;
+#ifdef CONFIG_SYMBIOTE
+		// Indicate that a symbiote thread has migrated cores in order
+		// to properly "fix" the gsbase value in context_switch() call.
+		// At this point a symbiote thread has been migrated while not being on a runqueue (i.e. sleeping, blocked).
+		if (p->symbiote_elevated) {
+			p->symbiote_migrated = 1;
+		}
+#endif
+	}
 	else
 #endif
 	if (p->in_iowait) {
@@ -5350,6 +5359,10 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 	calculate_sigpending();
 }
 
+#ifdef CONFIG_SYMBIOTE
+extern void arch_apply_smep_smap(unsigned disable_smep, unsigned disable_smap);
+#endif
+
 /*
  * context_switch - switch to the new MM and the new thread's register state.
  */
@@ -5389,6 +5402,8 @@ context_switch(struct rq *rq, struct task_struct *prev,
 
 		// Indicate that the migration has been handled
 		next->symbiote_migrated = 0;
+
+		arch_apply_smep_smap(next->symbiote_disable_smep, next->symbiote_disable_smap);
 	}
 #endif
 

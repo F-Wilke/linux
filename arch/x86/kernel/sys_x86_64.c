@@ -88,7 +88,7 @@ void symbi_lower(struct pt_regs* regs, struct SymbiReg* sreg){
 }
 
 // Something is prob broken in my inline assembly, don't know why normal optimization breaks...
-void __attribute__((optimize("O0"))) symbi_toggle_nosmap(int direction, struct SymbiReg* sreg){
+void __attribute__((optimize("O0"))) symbi_toggle_nosmap(int direction){
   // 1: disable smap
   // 0: enable smap
   uint64_t cr4;
@@ -120,6 +120,12 @@ void symbi_toggle_nosmep(int direction){
 	asm volatile("mov %0,%%cr4": "+r" (cr4) : : "memory");
 
 }
+
+void arch_apply_smep_smap(unsigned disable_smep, unsigned disable_smap) {
+  symbi_toggle_nosmep(disable_smep);
+  symbi_toggle_nosmap(disable_smap);
+}
+
 
 void symbi_elevate(struct pt_regs* regs, struct SymbiReg* sreg){
   // Swing symbiote reg
@@ -215,9 +221,13 @@ unsigned long arch_elevate(unsigned long flags){
 
   } else if(sreg.elevate){
     symbi_elevate(regs, &sreg);
-
+    current->symbiote_disable_smap = sreg.no_smap;
+    current->symbiote_disable_smep = sreg.no_smep;
+    
   } else if(!sreg.elevate){
     symbi_lower(regs, &sreg);
+    current->symbiote_disable_smap = 0;
+    current->symbiote_disable_smep = 0;
 
   } else{
     // NOTE: Unconditional print and return.
@@ -227,7 +237,7 @@ unsigned long arch_elevate(unsigned long flags){
   }
 
   if(sreg.toggle_smap){
-    symbi_toggle_nosmap(sreg.no_smap, &sreg);
+    symbi_toggle_nosmap(sreg.no_smap);
   }
   if(sreg.toggle_smep){
     symbi_toggle_nosmep(sreg.no_smep);

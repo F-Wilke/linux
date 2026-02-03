@@ -1049,6 +1049,10 @@ struct task_struct {
 
 	/* Used to indicate when a symbiote thread migrated cores */
 	unsigned 			symbiote_migrated:1;
+
+	/* Used to create the same environment after cpu migration */
+	unsigned            symbiote_disable_smep:1;
+	unsigned            symbiote_disable_smap:1;
 #endif
 	unsigned			in_nf_duplicate:1;
 #ifdef CONFIG_PREEMPT_RT
