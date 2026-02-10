@@ -11,6 +11,8 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h> // For kmalloc 
+#include <linux/hash.h>
+#include <linux/hashtable.h>
 
 #include <linux/mm.h> // For vm_area_struct and remap_pfn_range
 #include <linux/io.h>
@@ -37,7 +39,7 @@
 
 #define MALLOC(size) vmalloc(size)
 #define FREE(ptr) vfree(ptr)
-#define PRINT_ERR(msg) pr_err(msg)
+#define PRINT_ERR(...) pr_err(__VA_ARGS__)
 #define PRINT_INFOF(...) pr_info(__VA_ARGS__)
 #define LKS_LOCK(mu)   do { pr_info("%s: mutex_lock at %s:%d\n", MODULE_NAME, __func__, __LINE__); mutex_lock(mu); } while (0)
 #define LKS_UNLOCK(mu) do { pr_info("%s: mutex_unlock at %s:%d\n", MODULE_NAME, __func__, __LINE__); mutex_unlock(mu); } while (0)
@@ -199,6 +201,97 @@ static unsigned long modules_count = 0;
 static DEFINE_MUTEX(modules_lock);
 
 static char zeros[1024] = {0}; 
+
+static char* kallsyms_a_symbols = NULL;
+static char* kallsyms_a_buffer = NULL;
+static unsigned long kallsyms_a_buffer_size = 0;
+
+
+/* Hash table for filtered symbols (2^8 = 256 buckets) */
+#define SYMBOL_HASH_BITS 8
+static DEFINE_HASHTABLE(symbol_filter_table, SYMBOL_HASH_BITS);
+static DEFINE_MUTEX(symbol_filter_lock);
+
+/* Entry structure for each symbol in the hash table */
+struct symbol_entry {
+    char *name;
+    struct hlist_node node;
+};
+
+/* Add symbol to filter hash table */
+static int add_symbol_to_filter(const char *symbol_name) {
+    struct symbol_entry *entry;
+    u32 hash_val;
+    
+    if (!symbol_name || symbol_name[0] == '\0') {
+        return -EINVAL;
+    }
+    
+    entry = (struct symbol_entry *)kmalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry) {
+        PRINT_ERR("add_symbol_to_filter: entry alloc failed\n");
+        return -ENOMEM;
+    }
+    
+    entry->name = kstrdup(symbol_name, GFP_KERNEL);
+    if (!entry->name) {
+        kfree(entry);
+        PRINT_ERR("add_symbol_to_filter: name alloc failed\n");
+        return -ENOMEM;
+    }
+    
+    hash_val = full_name_hash(NULL, symbol_name, strlen(symbol_name));
+    
+    mutex_lock(&symbol_filter_lock);
+    hash_add(symbol_filter_table, &entry->node, hash_val);
+    mutex_unlock(&symbol_filter_lock);
+    
+    PRINT_INFOF("add_symbol_to_filter: added '%s' (hash=0x%x)\n", symbol_name, hash_val);
+    return 0;
+}
+
+/* Check if symbol exists in filter */
+static bool is_symbol_filtered(const char *symbol_name) {
+    struct symbol_entry *entry;
+    u32 hash_val;
+    bool found = false;
+    
+    if (!symbol_name) {
+        return false;
+    }
+    
+    hash_val = full_name_hash(NULL, symbol_name, strlen(symbol_name));
+    
+    mutex_lock(&symbol_filter_lock);
+    hash_for_each_possible(symbol_filter_table, entry, node, hash_val) {
+        if (strcmp(entry->name, symbol_name) == 0) {
+            found = true;
+            break;
+        }
+    }
+    mutex_unlock(&symbol_filter_lock);
+    
+    return found;
+}
+
+/* Clear all symbols from filter */
+static void clear_symbol_filter(void) {
+    struct symbol_entry *entry;
+    struct hlist_node *tmp;
+    int bkt;
+    unsigned long count = 0;
+    
+    mutex_lock(&symbol_filter_lock);
+    hash_for_each_safe(symbol_filter_table, bkt, tmp, entry, node) {
+        hash_del(&entry->node);
+        kfree(entry->name);
+        kfree(entry);
+        count++;
+    }
+    mutex_unlock(&symbol_filter_lock);
+    
+    PRINT_INFOF("clear_symbol_filter: removed %lu symbols\n", count);
+}
 
 /* ===================== GNU Hash Section Construction =====================
  * This implementation is adapted (simplified) from binutils' elflink.c
@@ -815,6 +908,51 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
         write_func(zeros, symtab_offset - cur_pos); cur_pos = symtab_offset;
         write_func(merged_syms, sizeof(Elf64_Sym) * (total_syms + 1));
         cur_pos += sizeof(Elf64_Sym) * (total_syms + 1);
+
+        //clobber unnecessary symbol names in unified_strtab, make all of them start with ZZZ to avoid overlap with libc symbols
+        //only if we have a hashset
+        if (kallsyms_a_symbols != NULL && !hash_empty(symbol_filter_table))
+        {
+            unsigned long offset = 1; // skip leading null byte
+            unsigned long clobbered_count = 0;
+            unsigned long kept_count = 0;
+            
+            while (offset < strTabLen) {
+                char *symbol_name = &unified_strtab[offset];
+                unsigned long symbol_len = strlen(symbol_name);
+                
+                if (symbol_len == 0) {
+                    // Empty string, skip
+                    offset++;
+                    continue;
+                }
+                
+                // Check if this symbol is in the filter hash table
+                if (!is_symbol_filtered(symbol_name)) {
+                    // Symbol is NOT in the filter - clobber it
+                    // Replace first 3 chars with "ZZZ" (or fewer if name is shorter)
+                    if (symbol_len >= 3) {
+                        unified_strtab[offset] = 'Z';
+                        unified_strtab[offset + 1] = 'Z';
+                        unified_strtab[offset + 2] = 'Z';
+                    } else if (symbol_len == 2) {
+                        unified_strtab[offset] = 'Z';
+                        unified_strtab[offset + 1] = 'Z';
+                    } else if (symbol_len == 1) {
+                        unified_strtab[offset] = 'Z';
+                    }
+                    clobbered_count++;
+                } else {
+                    // Symbol is in the filter or no filter active - keep it
+                    kept_count++;
+                }
+                
+                offset += symbol_len + 1; // move to next symbol (past null terminator)
+            }
+            
+            PRINT_INFOF("libkallsyms(ET_REL): symbol filtering: kept %lu, clobbered %lu\n", 
+                        kept_count, clobbered_count);
+        }
 
         // .strtab (use unified_strtab)
     PRINT_INFOF("libkallsyms(ET_REL): writing .strtab size=%lu\n", strTabLen);
@@ -1531,6 +1669,171 @@ static int kallsyms_mmap(struct file *file, struct vm_area_struct *vma) {
     return retVal;
 }
 
+
+static ssize_t kallsyms_a_elf_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
+    pr_info("%s: kallsyms_a_elf_write called, count: %lu\n", MODULE_NAME, count);
+    
+    if (!buf || count == 0) {
+        PRINT_ERR("kallsyms_a_elf_write: invalid input\n");
+        return -EINVAL;
+    }
+
+    if (*ppos != 0) {
+        PRINT_ERR("kallsyms_a_elf_write: only supports writing at offset 0\n");
+        return -EINVAL;
+    }
+    
+    // Allocate new buffer for combined data
+    unsigned long new_size = kallsyms_a_buffer_size + count;
+    char *new_buffer = (char*)MALLOC(new_size);
+    if (!new_buffer) {
+        PRINT_ERR("kallsyms_a_elf_write: buffer allocation failed\n");
+        return -ENOMEM;
+    }
+    
+    // Copy existing buffer if present
+    if (kallsyms_a_buffer && kallsyms_a_buffer_size > 0) {
+        memcpy(new_buffer, kallsyms_a_buffer, kallsyms_a_buffer_size);
+        FREE(kallsyms_a_buffer);
+    }
+    
+    // Copy from userspace
+    if (copy_from_user(new_buffer + kallsyms_a_buffer_size, buf, count)) {
+        FREE(new_buffer);
+        PRINT_ERR("kallsyms_a_elf_write: copy_from_user failed\n");
+        return -EFAULT;
+    }
+    
+    kallsyms_a_buffer = new_buffer;
+    kallsyms_a_buffer_size = new_size;
+
+    // special case: "0" means clear filter
+    if (new_size == 2 && new_buffer[0] == '0') {
+        PRINT_INFOF("kallsyms_a_elf_write: received clear filter command, clearing symbol filter\n");
+        clear_symbol_filter();
+        FREE(kallsyms_a_buffer);
+        kallsyms_a_buffer = NULL;
+        kallsyms_a_buffer_size = 0;
+        return count;
+    }
+
+    
+    // We only accept one write transaction that contains the full comma-separated symbol list
+    if (new_size > 0) {
+        // Buffer is terminated - validate and write
+        PRINT_INFOF("kallsyms_a_elf_write: buffer: (%lu bytes), validating\n", new_size);
+        
+        // Validate: check for comma-separated list
+        // Simple validation: ensure it contains only alphanumeric, underscore, comma, and whitespace
+        unsigned long i;
+        int valid = 1;
+        int has_content = 0;
+        
+        for (i = 0; i < new_size; i++) {
+            char c = new_buffer[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
+                (c >= '0' && c <= '9') || c == '_' || c == ',' || 
+                c == ' ' || c == '\t' || c == '\n') {
+                if (c != ' ' && c != '\t' && c != '\n' && c != ',') {
+                    has_content = 1;
+                }
+            } else {
+                valid = 0;
+                PRINT_ERR("kallsyms_a_elf_write: invalid character at position %lu: 0x%02x\n", i, (unsigned char)c);
+                break;
+            }
+        }
+        
+        if (valid && has_content) {
+            PRINT_INFOF("kallsyms_a_elf_write: validated comma-separated symbol list\n");
+            
+            // Clear existing filter table
+            clear_symbol_filter();
+            
+            // Parse comma-separated symbols and add to hash table
+            char *token_start = new_buffer;
+            char *p = new_buffer;
+            unsigned long symbol_count = 0;
+            char *end = new_buffer + new_size;
+            
+            while (p < end) {
+                // Skip whitespace
+                while (*p == ' ' || *p == '\t' || *p == '\n') {
+                    p++;
+                }
+                
+                if (*p == '\0') break;
+                
+                token_start = p;
+                
+                // Find end of symbol (comma or end)
+                while (*p != '\0' && *p != ',') {
+                    p++;
+                }
+                
+                // Extract symbol name
+                unsigned long token_len = p - token_start;
+                if (token_len > 0) {
+                    // Trim trailing whitespace
+                    while (token_len > 0 && 
+                           (token_start[token_len-1] == ' ' || 
+                            token_start[token_len-1] == '\t' || 
+                            token_start[token_len-1] == '\n')) {
+                        token_len--;
+                    }
+                    
+                    if (token_len > 0) {
+                        char *symbol_name = (char*)kmalloc(token_len + 1, GFP_KERNEL);
+                        if (symbol_name) {
+                            memcpy(symbol_name, token_start, token_len);
+                            symbol_name[token_len] = '\0';
+                            
+                            if (add_symbol_to_filter(symbol_name) == 0) {
+                                symbol_count++;
+                            }
+                            
+                            kfree(symbol_name);
+                        }
+                    }
+                }
+                
+                // Skip comma
+                if (*p == ',') {
+                    p++;
+                }
+            }
+            
+            PRINT_INFOF("kallsyms_a_elf_write: parsed and added %lu symbols to filter\n", symbol_count);
+            
+            // Free old kallsyms_a_symbols if it exists
+            if (kallsyms_a_symbols) {
+                FREE(kallsyms_a_symbols);
+            }
+            
+            // Transfer buffer to kallsyms_a_symbols
+            kallsyms_a_symbols = kallsyms_a_buffer;
+            kallsyms_a_buffer = NULL;
+            kallsyms_a_buffer_size = 0;
+            
+            PRINT_INFOF("kallsyms_a_elf_write: symbol list stored successfully\n");
+            return count;
+        } else {
+            PRINT_ERR("kallsyms_a_elf_write: validation failed - invalid symbol list format\n");
+            FREE(kallsyms_a_buffer);
+            kallsyms_a_buffer = NULL;
+            kallsyms_a_buffer_size = 0;
+            return -EINVAL;
+        }
+    } else {
+        // Not terminated yet, accumulating
+        PRINT_INFOF("kallsyms_a_elf_write: appended %lu bytes (total: %lu, not terminated)\n", 
+                    count, new_size);
+        return count;
+    }
+}
+
+
+
 static const struct proc_ops kallsyms_elf_fops = {
     .proc_open    = kallsyms_elf_open,
     .proc_read    = seq_read,
@@ -1544,6 +1847,7 @@ static const struct proc_ops kallsyms_ar_fops = {
     .proc_read    = seq_read,
     .proc_lseek   = kallsyms_ar_lseek,
     .proc_release = single_release,
+    .proc_write   = kallsyms_a_elf_write
 };
 
 
