@@ -916,6 +916,7 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
             unsigned long offset = 1; // skip leading null byte
             unsigned long clobbered_count = 0;
             unsigned long kept_count = 0;
+            char c1 = 'a', c2 = 'a', c3 = 'a';
             
             while (offset < strTabLen) {
                 char *symbol_name = &unified_strtab[offset];
@@ -930,18 +931,44 @@ static int makeElf(unsigned char type, lks_module_t *lks_mods, unsigned int num_
                 // Check if this symbol is in the filter hash table
                 if (!is_symbol_filtered(symbol_name)) {
                     // Symbol is NOT in the filter - clobber it
-                    // Replace first 3 chars with "ZZZ" (or fewer if name is shorter)
+                    // Replace first 3 chars with c1,c2,c3 (e.g., aaa, aab, aac, etc.) to avoid collisions with real symbols
                     if (symbol_len >= 3) {
-                        unified_strtab[offset] = 'Z';
-                        unified_strtab[offset + 1] = 'Z';
-                        unified_strtab[offset + 2] = 'Z';
+                        unified_strtab[offset] = c1;
+                        unified_strtab[offset + 1] = c2;
+                        unified_strtab[offset + 2] = c3;
                     } else if (symbol_len == 2) {
-                        unified_strtab[offset] = 'Z';
-                        unified_strtab[offset + 1] = 'Z';
+                        unified_strtab[offset] = c1;
+                        unified_strtab[offset + 1] = c2;
                     } else if (symbol_len == 1) {
-                        unified_strtab[offset] = 'Z';
+                        unified_strtab[offset] = c1;
                     }
                     clobbered_count++;
+                    // increment chars for next clobber: aaa -> aab -> ... -> aaz -> aaA -> ... -> aaZ -> aba -> ... -> ZZZ
+                    // Each position cycles through a-z then A-Z (52 chars total, giving 52^3 = 140,608 combinations)
+                    if (c3 == 'z') {
+                        c3 = 'A';
+                    } else if (c3 == 'Z') {
+                        c3 = 'a';
+                        // Carry to c2
+                        if (c2 == 'z') {
+                            c2 = 'A';
+                        } else if (c2 == 'Z') {
+                            c2 = 'a';
+                            // Carry to c1
+                            if (c1 == 'z') {
+                                c1 = 'A';
+                            } else if (c1 == 'Z') {
+                                c1 = 'a'; // wrap around (overflow)
+                            } else {
+                                c1++;
+                            }
+                        } else {
+                            c2++;
+                        }
+                    } else {
+                        c3++;
+                    }
+
                 } else {
                     // Symbol is in the filter or no filter active - keep it
                     kept_count++;
