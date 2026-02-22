@@ -1043,18 +1043,19 @@ struct task_struct {
 	/* delay due to memory thrashing */
 	unsigned                        in_thrashing:1;
 #endif
+unsigned			in_nf_duplicate:1;
 #ifdef CONFIG_SYMBIOTE
-    /* Used to signal symbiote status. */
-	unsigned			symbiote_elevated:1;
 
-	/* Used to indicate when a symbiote thread migrated cores */
-	unsigned 			symbiote_migrated:1;
+/* Used to indicate when a symbiote thread migrated cores */
+unsigned 			symbiote_migrated:1;
 
-	/* Used to create the same environment after cpu migration */
-	unsigned            symbiote_disable_smep:1;
-	unsigned            symbiote_disable_smap:1;
+/* Used to create the same environment after cpu migration */
+unsigned            symbiote_disable_smep:1;
+unsigned            symbiote_disable_smap:1;
+
+/* Used to signal symbiote status, needs to be byte to make it easily accessible from assembly */
+uint8_t			symbiote_elevated;
 #endif
-	unsigned			in_nf_duplicate:1;
 #ifdef CONFIG_PREEMPT_RT
 	struct netdev_xmit		net_xmit;
 #endif
