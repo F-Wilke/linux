@@ -48,6 +48,39 @@ uint64_t symbi_check_elevate(){
   return current->symbiote_elevated;
 }
 
+//this is to be called from an elevated process.
+__attribute((unused)) __attribute((naked)) int symbi_fast_lower(void) {
+    register long int rsp;
+    __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
+    if (rsp < 0) //we need to be on the user stack 
+      return -1;
+
+  current->symbiote_elevated = 0;
+
+  //RESET_KERN_GS_USER_GS_CLI;
+    __asm__ __volatile__ (        
+    "cli;" 
+    "movl $0x0, %%edx;" 
+    "movl $0x0, %%eax;" 
+    "movl $0xc0000101, %%ecx;" 
+    "wrmsr;"                   
+    :: :"%rax", "%edx", "%ecx" 
+    );
+  // DO_IRET_LOWER;
+    __asm__ __volatile__ ( \
+      "lea 8(%%rsp), %%rax;" \ 
+      "pushq $0x2b;" \
+      "pushq %%rax;" \
+      "pushq $0x202;"\
+      "pushq $0x33;"\
+      "pushq -8(%%rax);"\
+      "movq $0x0, %%rax;" \ 
+      "iretq;" \
+      ::: "memory" \
+    ); 
+
+}
+
 void symbi_print_user_reg_state(struct pt_regs * regs){
   printk("IP %#lx\n", regs->ip);
   printk("SP %#lx\n", regs->sp);
