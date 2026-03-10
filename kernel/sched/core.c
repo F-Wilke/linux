@@ -2515,15 +2515,6 @@ static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 	activate_task(rq, p, 0);
 	wakeup_preempt(rq, p, 0);
 
-
-#ifdef CONFIG_SYMBIOTE
-	// Indicate that a symbiote thread has migrated cores in order
-	// to properly "fix" the gsbase value in context_switch() call.
-    if (p->symbiote_elevated) {
-		p->symbiote_migrated = 1;
-	}
-#endif
-
 	return rq;
 }
 
@@ -3370,6 +3361,13 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 		rseq_migrate(p);
 		sched_mm_cid_migrate_from(p);
 		perf_event_task_migrate(p);
+		#ifdef CONFIG_SYMBIOTE
+		// Indicate that a symbiote thread has migrated cores in order
+		// to properly "fix" the gsbase value in context_switch() call.
+		if (p->symbiote_elevated) {
+			p->symbiote_migrated = 1;
+		}
+		#endif
 	}
 
 	__set_task_cpu(p, new_cpu);
