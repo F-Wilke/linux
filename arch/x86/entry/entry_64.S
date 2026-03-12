@@ -766,12 +766,10 @@ SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp
 	UNWIND_HINT_END_OF_STACK
 
-	/* Copy the IRET frame to the trampoline stack. */
-	pushq	$__KERNEL_DS	/* SS */
+	/* Copy return info to the trampoline stack. */
 	pushq	5*8(%rdi)	/* RSP */
-	pushq	4*8(%rdi)	/* EFLAGS */
-	pushq	$__KERNEL_CS	/* CS */
 	pushq	2*8(%rdi)	/* RIP */
+	pushq	4*8(%rdi)	/* EFLAGS */
 
 	/* Push user RDI on the trampoline stack. */
 	pushq	(%rdi)
@@ -790,12 +788,14 @@ SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
 
 	swapgs
 
-	/* Swing to user stack and pop state flags */
-	movq	0x18(%rsp), %rsp
-	popfq
+	popfq				/* load user flags from kernel stack */
+	movq	0(%rsp), %rcx		/* place the return address in %rcx */
+	movq	8(%rsp), %rsp		/* swing to user stack */
+	
+	ANNOTATE_NOENDBR
+	jmp	*%rcx	
 
-	ANNOTATE_NOENDBR // exc_double_fault
-	retq
+
 SYM_CODE_END(common_interrupt_return)
 _ASM_NOKPROBE(common_interrupt_return)
 
