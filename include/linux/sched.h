@@ -975,6 +975,14 @@ struct task_struct {
 	/* delay due to memory thrashing */
 	unsigned                        in_thrashing:1;
 #endif
+#ifdef CONFIG_SYMBIOTE
+	/*
+	 * Elevation status flag: 0 = normal user process, 1 = elevated to
+	 * kernel privilege. Byte-sized so the low byte of %rax can be tested
+	 * directly in assembly (testb $0x1, %al) without masking.
+	 */
+	uint8_t				symbiote_elevated;
+#endif
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 
