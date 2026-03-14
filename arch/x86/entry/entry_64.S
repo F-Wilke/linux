@@ -120,6 +120,19 @@ SYM_INNER_LABEL(entry_SYSCALL_64_after_hwframe, SYM_L_GLOBAL)
 
 	call	do_syscall_64		/* returns with IRQs disabled */
 
+#ifdef CONFIG_SYMBIOTE
+	/*
+	 * Check if this is an elevated process. Elevated processes use a
+	 * specialized syscall return path (symbi_return_to_usermode) that
+	 * avoids writing to the user stack.
+	 */
+	pushq	%rax
+	call	symbi_check_elevate
+	testb	$0x1, %al
+	popq	%rax
+	jnz	symbi_return_to_usermode
+#endif
+
 	/*
 	 * Try to use SYSRET instead of IRET if we're returning to
 	 * a completely clean 64-bit userspace context.  If we're not,
@@ -733,6 +746,86 @@ native_irq_return_ldt:
 	 */
 	jmp	native_irq_return_iret
 #endif
+
+#ifdef CONFIG_SYMBIOTE
+/*
+ * Exit path for elevated processes returning from a system call.
+ *
+ * The user should expect RCX and R11 to be clobbered on return from a
+ * syscall, as they are typically used by sysret for RIP and RFLAGS.
+ * See: https://stackoverflow.com/questions/47983371/
+ *
+ * This exit path avoids extending the user stack by:
+ *   - Arranging EFLAGS, RIP, and RSP on the kernel (trampoline) stack
+ *   - Using popfq to load user flags from the kernel stack
+ *   - Loading the return address into %rcx (clobbered by syscall anyway)
+ *   - Swinging to the user RSP and jumping to %rcx
+ *
+ * Compare with the old approach which pushed flags and return address onto
+ * the user stack, then used popfq + retq from the user stack.
+ */
+SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
+	IBRS_EXIT
+	STACKLEAK_ERASE
+	POP_REGS pop_rdi=0
+
+	/*
+	 * The stack is now: user RDI, orig_ax, RIP, CS, EFLAGS, RSP, SS.
+	 * Save old stack pointer and switch to trampoline stack.
+	 */
+	movq	%rsp, %rdi
+	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp
+	UNWIND_HINT_END_OF_STACK
+
+	/*
+	 * Push user RSP, RIP, and EFLAGS to the trampoline stack.
+	 * After popq %rdi (below), the trampoline stack will be:
+	 *   %rsp+0:  EFLAGS (user flags)
+	 *   %rsp+8:  RIP    (user return address)
+	 *   %rsp+16: RSP    (user stack pointer)
+	 *
+	 * Offsets from %rdi (saved kernel stack after POP_REGS pop_rdi=0):
+	 *   0*8(%rdi) = user RDI
+	 *   1*8(%rdi) = orig_ax
+	 *   2*8(%rdi) = RIP  (user return address)
+	 *   3*8(%rdi) = CS
+	 *   4*8(%rdi) = EFLAGS (user flags)
+	 *   5*8(%rdi) = RSP  (user stack pointer)
+	 *   6*8(%rdi) = SS
+	 */
+	pushq	5*8(%rdi)	/* RSP  */
+	pushq	2*8(%rdi)	/* RIP  */
+	pushq	4*8(%rdi)	/* EFLAGS */
+
+	/* Push user RDI on the trampoline stack. */
+	pushq	(%rdi)
+
+	/*
+	 * We are on the trampoline stack. All regs except RDI are live.
+	 * We can do future final exit work right here.
+	 */
+	STACKLEAK_ERASE_NOCLOBBER
+
+	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi
+
+	/* Restore RDI. */
+	popq	%rdi
+
+	swapgs
+	CLEAR_CPU_BUFFERS
+
+	/*
+	 * Pop user EFLAGS from the kernel (trampoline) stack — no user stack
+	 * access needed. Load user RIP into %rcx (clobbered by syscall
+	 * convention), swing to user RSP, and jump to the return address.
+	 */
+	popfq				/* load user flags from kernel stack */
+	movq	0(%rsp), %rcx		/* place the return address in %rcx */
+	movq	8(%rsp), %rsp		/* swing to user stack */
+	ANNOTATE_NOENDBR
+	jmp	*%rcx			/* return to user code */
+#endif /* CONFIG_SYMBIOTE */
+
 SYM_CODE_END(common_interrupt_return)
 _ASM_NOKPROBE(common_interrupt_return)
 

@@ -22,6 +22,20 @@
 #include <asm/elf.h>
 #include <asm/ia32.h>
 
+#ifdef CONFIG_SYMBIOTE
+/**
+ * symbi_check_elevate - check if the current task is elevated
+ *
+ * Returns the symbiote_elevated field of the current task struct.
+ * Called from entry_64.S to determine whether to use the elevated
+ * syscall return path (symbi_return_to_usermode).
+ */
+uint8_t symbi_check_elevate(void)
+{
+	return current->symbiote_elevated;
+}
+#endif /* CONFIG_SYMBIOTE */
+
 /*
  * Align a virtual address to avoid aliasing in the I$ on AMD F15h.
  */

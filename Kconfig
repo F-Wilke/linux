@@ -30,3 +30,10 @@ source "lib/Kconfig"
 source "lib/Kconfig.debug"
 
 source "Documentation/Kconfig"
+
+config SYMBIOTE
+	bool "Symbiote Linux"
+	help
+	  Enable Symbiote mode. Adds a 'kelevate' syscall that allows a process
+	  to elevate itself to kernel privilege level. Very dangerous; only
+	  enable for experimental use.
