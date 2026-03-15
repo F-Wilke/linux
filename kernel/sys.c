@@ -955,6 +955,19 @@ SYSCALL_DEFINE1(setfsgid, gid_t, gid)
 }
 #endif /* CONFIG_MULTIUSER */
 
+extern unsigned long arch_elevate(unsigned long flags);
+
+// Returns elevation status: 1-elevated 0-lowered.
+// Returns -1 on incorrect input.
+SYSCALL_DEFINE1(elevate, unsigned long, flags)
+{
+#ifdef CONFIG_SYMBIOTE
+	return arch_elevate(flags);
+#else
+	return -ENOSYS;
+#endif
+}
+
 /**
  * sys_getpid - return the thread group id of the current process
  *

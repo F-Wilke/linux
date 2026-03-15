@@ -976,12 +976,15 @@ struct task_struct {
 	unsigned                        in_thrashing:1;
 #endif
 #ifdef CONFIG_SYMBIOTE
-	/*
-	 * Elevation status flag: 0 = normal user process, 1 = elevated to
-	 * kernel privilege. Byte-sized so the low byte of %rax can be tested
-	 * directly in assembly (testb $0x1, %al) without masking.
-	 */
-	uint8_t				symbiote_elevated;
+/* Used to indicate when a symbiote thread migrated cores */
+unsigned 			symbiote_migrated:1;
+
+/* Used to create the same environment after cpu migration */
+unsigned            symbiote_disable_smep:1;
+unsigned            symbiote_disable_smap:1;
+
+/* Used to signal symbiote status, needs to be byte to make it easily accessible from assembly */
+uint8_t			symbiote_elevated;
 #endif
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */

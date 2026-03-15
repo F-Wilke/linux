@@ -23,16 +23,229 @@
 #include <asm/ia32.h>
 
 #ifdef CONFIG_SYMBIOTE
-/**
- * symbi_check_elevate - check if the current task is elevated
- *
- * Returns the symbiote_elevated field of the current task struct.
- * Called from entry_64.S to determine whether to use the elevated
- * syscall return path (symbi_return_to_usermode).
- */
+
+struct SymbiReg {
+  union {
+    uint64_t raw;
+    struct {
+      uint64_t elevate     : 1; // Bit 0
+      uint64_t query       : 1; // Bit 1
+      uint64_t int_disable : 1; // Bit 2
+      uint64_t debug       : 2; // Bit 3-4
+      uint64_t no_smep     : 1; // Bit 5
+      uint64_t no_smap     : 1; // Bit 6
+      uint64_t toggle_smep : 1; // Bit 7
+      uint64_t toggle_smap : 1; // Bit 8
+      uint64_t ret         : 1; // Bit 9
+      uint64_t fast_lower  : 1; // Bit 10
+    };
+  };
+}__attribute__((packed));
+
+uint8_t symbi_check_elevate(void);
 uint8_t symbi_check_elevate(void)
 {
-	return current->symbiote_elevated;
+  return current->symbiote_elevated;
+}
+
+void symbi_print_user_reg_state(struct pt_regs * regs){
+  printk("IP %#lx\n", regs->ip);
+  printk("SP %#lx\n", regs->sp);
+  printk("CS %#lx\n", regs->cs);
+  printk("SS %#lx\n", regs->ss);
+  printk("FG %#lx\n", regs->flags);
+  printk("\n");
+}
+
+void symbi_query(struct pt_regs* regs){
+  int ret = symbi_check_elevate();
+  if(ret & 1){
+    regs->ss = 0x18;
+    regs->cs = 0x10;
+  }else{
+    BUG_ON(regs->cs != 0x33);
+    BUG_ON(regs->ss != 0x2b);
+  }
+}
+
+void symbi_lower(struct pt_regs* regs, struct SymbiReg* sreg){
+  if(current->symbiote_elevated == 1 ){
+    current->symbiote_elevated = 0;
+  } else{
+    printk("Trying to lower non elevated task???\n");
+  }
+
+  // User interrupts better be enabled....
+  if( (regs->flags & (1<<9)) == 0){
+    if(sreg->debug){
+      printk("Warning: attempted lowering with user interrupts disabled... enabling!");
+    }
+    regs->flags = regs->flags | (1<<9);
+  }
+  // Established at syscall entry.
+  BUG_ON(regs->cs != 0x33);
+  BUG_ON(regs->ss != 0x2b);
+}
+
+// Something is prob broken in my inline assembly, don't know why normal optimization breaks...
+void __attribute__((optimize("O0"))) symbi_toggle_nosmap(int direction){
+  // 1: disable smap
+  // 0: enable smap
+  uint64_t cr4;
+  uint64_t x86_CR4_SMAP = 1 << 21; // XXX just trying the smap one
+
+  asm volatile("movq %%cr4,%0" : "=r"( cr4 ));
+  if(direction){
+    cr4 &= ~x86_CR4_SMAP;
+  }else{
+    cr4 |= x86_CR4_SMAP;
+  }
+	asm volatile("mov %0,%%cr4": "+r" (cr4) : : "memory");
+}
+
+void symbi_toggle_nosmep(int direction){
+  // 1: disable smep
+  // 0: enable smep
+  uint64_t cr4;
+  uint64_t x86_CR4_SMEP = 1 << 20;
+
+  asm volatile("movq %%cr4,%0" : "=r"( cr4 ));
+  // When this bit (20) is set, smep is enabled.
+  if(direction){
+    cr4 &= ~x86_CR4_SMEP;
+  }else{
+    cr4 |= x86_CR4_SMEP;
+  }
+	asm volatile("mov %0,%%cr4": "+r" (cr4) : : "memory");
+
+}
+
+void arch_apply_smep_smap(unsigned disable_smep, unsigned disable_smap) {
+  symbi_toggle_nosmep(disable_smep);
+  symbi_toggle_nosmap(disable_smap);
+}
+
+
+void symbi_elevate(struct pt_regs* regs, struct SymbiReg* sreg){
+  // Swing symbiote reg
+  if(current->symbiote_elevated == 1 ){
+    printk("Already Elevated???\n");
+  } else{
+    current->symbiote_elevated = 1;
+  }
+
+  // Modify stack memory used for iret. // x86 specific
+  regs->ss = 0x18;
+  regs->cs = 0x10;
+
+  // Disable interrupts for user
+  if(sreg->int_disable){
+    regs->flags= regs->flags & (~(1<<9)); // x86 specific
+  }
+}
+
+void symbi_debug_entry(struct pt_regs *regs, struct SymbiReg *sreg){
+  printk("Elevate Syscall Case: ");
+  // What case are we in?
+  if(sreg->query){
+    printk("Query\n");
+  } else if(sreg->elevate){
+    printk("Elevate\n");
+  } else if(!sreg->elevate){
+    printk("Lower\n");
+  } else{
+    printk("Error\n");
+  }
+
+  printk("Debug level is %d", sreg->debug);
+  if(sreg->int_disable){
+    printk("Return with interrupts disabled\n");
+  }
+
+  if(sreg->no_smep){
+    printk("Return with SMEP disabled\n");
+  } else {
+    printk("Return with SMEP enabled\n");
+  }
+
+  if(sreg->no_smap){
+    printk("Return with SMAP disabled\n");
+  } else {
+    printk("Return with SMAP enabled\n");
+  }
+
+  if(sreg->ret){
+    printk("Return using ret instead of iret (switch NYI)\n");
+  } else{
+    printk("Return using iret instead of ret (switch NYI)\n");
+  }
+
+  if(sreg->fast_lower){
+    printk("Should not have gotten to syscall on fast lower\n");
+    printk("Shortcut this in symbi lib\n");
+    while(1);
+  }else{
+    printk("Return using slow syscall-sysret lower\n");
+  }
+
+  printk("Was user elevated? %x", symbi_check_elevate());
+  printk("Syscall passed flags: %#llx\n", sreg->raw);
+  printk("db: %x id: %x q: %x e: %x\n", sreg->debug, sreg->int_disable, sreg->query, sreg->elevate);
+
+  printk("fl: %x ret: %x nosmap: %x nosmep: %x\n", sreg->fast_lower, sreg->ret, sreg->no_smap, sreg->no_smep);
+
+  printk("User reg state inbound\n");
+  symbi_print_user_reg_state(regs);
+}
+
+unsigned long arch_elevate(unsigned long flags){
+  struct pt_regs *regs;
+
+  struct SymbiReg sreg;
+  sreg.raw = flags;
+
+  // User's registers
+  regs = (struct pt_regs *)current_top_of_stack() - 1;
+
+  if(sreg.debug){
+    symbi_debug_entry(regs, &sreg);
+  }
+
+  // Careful with order, obviously only executes first matching.
+  if(sreg.query){
+    symbi_query(regs);
+
+  } else if(sreg.elevate){
+    symbi_elevate(regs, &sreg);
+    current->symbiote_disable_smap = sreg.no_smap;
+    current->symbiote_disable_smep = sreg.no_smep;
+
+  } else if(!sreg.elevate){
+    symbi_lower(regs, &sreg);
+    current->symbiote_disable_smap = 0;
+    current->symbiote_disable_smep = 0;
+
+  } else{
+    // NOTE: Unconditional print and return.
+    printk("Elevation error: Unexpected input %lx\n", flags);
+    symbi_print_user_reg_state(regs);
+    return -1;
+  }
+
+  if(sreg.toggle_smap){
+    symbi_toggle_nosmap(sreg.no_smap);
+  }
+  if(sreg.toggle_smep){
+    symbi_toggle_nosmep(sreg.no_smep);
+  }
+
+
+  if(sreg.debug){
+    printk("Elevate bit now %x", symbi_check_elevate());
+    symbi_print_user_reg_state(regs);
+    printk("Abt to ret from elevate syscall\n");
+  }
+  return symbi_check_elevate();
 }
 #endif /* CONFIG_SYMBIOTE */
 

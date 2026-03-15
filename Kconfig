@@ -33,7 +33,6 @@ source "Documentation/Kconfig"
 
 config SYMBIOTE
 	bool "Symbiote Linux"
+	def_bool y
 	help
-	  Enable Symbiote mode. Adds a 'kelevate' syscall that allows a process
-	  to elevate itself to kernel privilege level. Very dangerous; only
-	  enable for experimental use.
+	  Turn on Symbiote mode. Adds a syscall "elevate". Very dangerous...
