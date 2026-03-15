@@ -747,14 +747,6 @@ native_irq_return_ldt:
 SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
 
 
-	movq	RIP(%rsp), %r15 /* return address in r15 */
-	movq	RSP(%rsp), %r14	 /* user stack in r14 */
-	subq	$0x10, %r14 //we make room for two qwords
-	movq	%r15, 8(%r14) //this will be used in retq
-	movq	EFLAGS(%rsp), %r15 /* EFLAGS in r15 */
-	movq	%r15, (%r14) //this will be used in popfq
-	movq	%r14, RSP(%rsp)
-
 	STACKLEAK_ERASE
 	POP_REGS pop_rdi=0
 
