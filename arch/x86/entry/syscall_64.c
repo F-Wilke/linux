@@ -20,6 +20,43 @@
 #undef  __SYSCALL_NORETURN
 #define __SYSCALL_NORETURN __SYSCALL
 
+
+#define EF_STACK_DEBUG
+
+
+#ifdef EF_STACK_DEBUG
+
+extern unsigned long ef_stacks[512];  /* 4096 bytes / 8 = 512 entries */
+
+EXPORT_SYMBOL(ef_stacks);
+
+asmlinkage void ef_stack_badword_error(unsigned long badword, unsigned long offset,
+				       unsigned long efstack_bottom, unsigned long cpu);
+
+
+asmlinkage void ef_stack_badword_error(unsigned long badword, unsigned long offset,
+				       unsigned long efstack_bottom, unsigned long cpu)
+{
+    pr_emerg("\n");
+    pr_emerg("========================================\n");
+    pr_emerg("  EF STACK CHECK FAILURE\n");
+    pr_emerg("========================================\n");
+    pr_emerg("  efstack cpu: %lu\n", cpu);
+    pr_emerg("  efstack_bottom:  0x%016lx\n", efstack_bottom);
+    pr_emerg("  offset of badword: 0x%016lx\n", offset);
+    pr_emerg("  wordvalue:      0x%016lx (expected 0x0000000000000000)\n", badword);
+    pr_emerg("========================================\n");
+    pr_emerg("\n");
+    
+    /* Dump the corrupted page contents */
+    print_hex_dump(KERN_EMERG, "Page contents: ", DUMP_PREFIX_OFFSET,
+                   16, 8, (void *)efstack_bottom, PAGE_SIZE, true);
+    
+    /* Halt the system */
+    panic("Debug checksum verification failed - memory corruption detected");
+}
+#endif
+
 /*
  * The sys_call_table[] is no longer used for system calls, but
  * kernel/trace/trace_syscalls.c still wants to know the system

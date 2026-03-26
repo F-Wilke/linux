@@ -42,10 +42,86 @@
 #include <linux/err.h>
 
 #include "calling.h"
+	
+#define EF_STACK_DEBUG
+	
+#ifdef EF_STACK_DEBUG
+    .section .data
+    .align PAGE_SIZE                    /* Page-align for cache efficiency */
 
+    .globl ef_stacks
+    .type  ef_stacks, @object
+ef_stacks:
+    .fill 4096/8, 8, 0                  
+    .size ef_stacks, . - ef_stacks
+
+    .globl ef_stack_check_skip
+    .type  ef_stack_check_skip, @object	
+ef_stack_check_skip:
+    .fill 1, 8, 0
+    .size ef_stack_check_skip, . - ef_stack_check_skip	
+#endif
+	
 .code64
 .section .entry.text, "ax"
 
+
+#ifdef EF_STACK_DEBUG 	
+.macro EF_STACK_DEBUG_HOOK
+   /* Save registers we'll clobber */
+    pushq   %rdi
+    pushq   %rbx
+    pushq   %rcx
+    pushq   %rdx
+    pushq   %rsi
+
+    leaq    ef_stacks(%rip), %rbx
+    xorq    %rcx, %rcx
+	
+   // loop stack pointers: stop on first null pointer
+.Lef_stacks_next\@:
+    movq    (%rbx,%rcx,8), %rdx
+    testq   %rdx, %rdx
+    jz .Lef_stacks_done\@
+
+    movq    $((4096/8)-1), %rsi              /* index of last word on page (511)*/	
+    subq    ef_stack_check_skip(%rip), %rsi  /* number of words from top of stack to skip */
+    // check the words of this page	
+.Lef_check_ef_stack_word\@:
+    mov    (%rdx, %rsi, 8), %rdi
+    testq  %rdi, %rdi
+    // goto error if word is not zero!	
+    jnz    .Lef_stack_word_error\@
+	
+    decq   %rsi
+    jge   .Lef_check_ef_stack_word\@
+	
+    inc    %rcx   
+    jmp    .Lef_stacks_next\@
+	
+.Lef_stack_word_error\@:
+  /* We leave stack dirty so that you can see what the register values were */	
+  //  addq    $40, %rsp   
+    
+    // fix direction flag for safe c-calling
+    cld                                 
+    // rcx cpu of bad stack
+    // rdx BOTTOM of bad stack
+    // rsi offset of bad word
+    // rdi bad word value
+    call ef_stack_badword_error
+    // 	
+.Lef_stacks_done\@:
+    /* Restore registers */
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rbx
+    popq    %rdi
+.endm
+
+#endif
+	
 /*
  * 64-bit SYSCALL instruction entry. Up to 6 arguments in registers.
  *
@@ -88,11 +164,16 @@ SYM_CODE_START(entry_SYSCALL_64)
 	UNWIND_HINT_ENTRY
 	ENDBR
 
+
 	swapgs
 	/* tss.sp2 is scratch space. */
 	movq	%rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp
 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+
+#ifdef 	EF_STACK_DEBUG
+	EF_STACK_DEBUG_HOOK
+#endif	
 
 SYM_INNER_LABEL(entry_SYSCALL_64_safe_stack, SYM_L_GLOBAL)
 	ANNOTATE_NOENDBR
@@ -346,6 +427,9 @@ SYM_CODE_START(\asmsym)
 	.endif
 
 	ENDBR
+#ifdef 	EF_STACK_DEBUG
+	EF_STACK_DEBUG_HOOK
+#endif	
 	ASM_CLAC
 	cld
 
@@ -407,6 +491,11 @@ SYM_CODE_END(\asmsym)
 SYM_CODE_START(\asmsym)
 	UNWIND_HINT_IRET_ENTRY
 	ENDBR
+
+#ifdef 	EF_STACK_DEBUG
+	EF_STACK_DEBUG_HOOK
+#endif	
+
 	ASM_CLAC
 	cld
 
@@ -464,6 +553,11 @@ SYM_CODE_END(\asmsym)
 SYM_CODE_START(\asmsym)
 	UNWIND_HINT_IRET_ENTRY
 	ENDBR
+
+#ifdef 	EF_STACK_DEBUG
+	EF_STACK_DEBUG_HOOK
+#endif	
+	
 	ASM_CLAC
 	cld
 
@@ -528,6 +622,11 @@ SYM_CODE_END(\asmsym)
 SYM_CODE_START(\asmsym)
 	UNWIND_HINT_IRET_ENTRY offset=8
 	ENDBR
+
+#ifdef 	EF_STACK_DEBUG
+	EF_STACK_DEBUG_HOOK
+#endif	
+	
 	ASM_CLAC
 	cld
 
@@ -1235,6 +1334,10 @@ SYM_CODE_START(asm_exc_nmi)
 	PUSH_AND_CLEAR_REGS rdx=(%rdx)
 	ENCODE_FRAME_POINTER
 
+#ifdef 	EF_STACK_DEBUG
+	EF_STACK_DEBUG_HOOK
+#endif	
+
 	IBRS_ENTER
 	UNTRAIN_RET
 
@@ -1456,6 +1559,10 @@ end_repeat_nmi:
 	 */
 	call	paranoid_entry
 	UNWIND_HINT_REGS
+
+#ifdef 	EF_STACK_DEBUG
+	EF_STACK_DEBUG_HOOK
+#endif	
 
 	movq	%rsp, %rdi
 	call	exc_nmi
