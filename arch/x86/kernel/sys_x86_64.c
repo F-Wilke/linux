@@ -57,26 +57,19 @@ __attribute((unused)) __attribute((naked)) int symbi_fast_lower(void) {
 
   current->symbiote_elevated = 0;
 
-  //RESET_KERN_GS_USER_GS_CLI;
-    __asm__ __volatile__ (        
-    "cli;" 
-    "movl $0x0, %%edx;" 
-    "movl $0x0, %%eax;" 
-    "movl $0xc0000101, %%ecx;" 
-    "wrmsr;"                   
-    :: :"%rax", "%edx", "%ecx" 
-    );
-  // DO_IRET_LOWER;
-    __asm__ __volatile__ ( \
-      "lea 8(%%rsp), %%rax;" \ 
-      "pushq $0x2b;" \
-      "pushq %%rax;" \
-      "pushq $0x202;"\
-      "pushq $0x33;"\
-      "pushq -8(%%rax);"\
-      "movq $0x0, %%rax;" \ 
-      "iretq;" \
-      ::: "memory" \
+    // DO_IRET_LOWER;
+    __asm__ __volatile__ ( 
+      "cli;" 
+      "lea 8(%%rsp), %%rax;" 
+      "pushq $0x2b;" 
+      "pushq %%rax;" 
+      "pushq $0x202;"
+      "pushq $0x33;"
+      "pushq -8(%%rax);"
+      "movq $0x0, %%rax;"
+      "wrgsbase %%rax;"
+      "iretq;" 
+      ::: "memory" 
     ); 
 
 }
