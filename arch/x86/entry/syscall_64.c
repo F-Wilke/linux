@@ -27,8 +27,10 @@
 #ifdef EF_STACK_DEBUG
 
 extern unsigned long ef_stacks[512];  /* 4096 bytes / 8 = 512 entries */
+extern unsigned long ef_stack_check_skip;
 
 EXPORT_SYMBOL(ef_stacks);
+EXPORT_SYMBOL(ef_stack_check_skip);
 
 asmlinkage void ef_stack_badword_error(unsigned long badword, unsigned long offset,
 				       unsigned long efstack_bottom, unsigned long cpu);
