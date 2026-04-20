@@ -49,7 +49,33 @@ uint64_t symbi_check_elevate(){
 }
 
 //this is to be called from an elevated process.
-__attribute((unused)) __attribute((naked)) int symbi_fast_lower(void) {
+__attribute((unused)) __attribute((naked)) int symbi_fast_lower_iret(void) {
+    register long int rsp;
+    __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
+    if (rsp < 0) //we need to be on the user stack 
+      return -1;
+
+  current->symbiote_elevated = 0;
+
+    // DO_IRET_LOWER;
+    __asm__ __volatile__ ( 
+      "lea 8(%%rsp), %%rax;" 
+      "pushq $0x2b;" 
+      "pushq %%rax;" 
+      "pushq $0x202;"
+      "pushq $0x33;"
+      "pushq -8(%%rax);"
+      "cli;" 
+      "movq $0x0, %%rax;"
+      "wrgsbase %%rax;"
+      "iretq;" 
+      ::: "memory" 
+    ); 
+
+}
+
+
+__attribute((unused)) __attribute((naked)) int symbi_fast_lower_sysret(void) {
     register long int rsp;
     __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
     if (rsp < 0) //we need to be on the user stack 
@@ -60,16 +86,13 @@ __attribute((unused)) __attribute((naked)) int symbi_fast_lower(void) {
     // DO_IRET_LOWER;
     __asm__ __volatile__ ( 
       "cli;" 
-      "lea 8(%%rsp), %%rax;" 
-      "pushq $0x2b;" 
-      "pushq %%rax;" 
-      "pushq $0x202;"
-      "pushq $0x33;"
-      "pushq -8(%%rax);"
+      "movq (%%rsp), %%rcx;" 
+      "movq $0x202, %%r11;"
+      "addq $8, %%rsp;"   //sysret obviously doesn't pop the return address
       "movq $0x0, %%rax;"
       "wrgsbase %%rax;"
-      "iretq;" 
-      ::: "memory" 
+      "sysretq;" 
+      ::: "memory"
     ); 
 
 }
