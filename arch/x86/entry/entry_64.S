@@ -743,7 +743,7 @@ native_irq_return_ldt:
 	 */
 	jmp	native_irq_return_iret
 #endif
-
+#ifdef CONFIG_SYMBIOTE
 SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
 
 
@@ -786,7 +786,7 @@ SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
 	
 	ANNOTATE_NOENDBR
 	jmp	*%rcx	
-
+#endif
 
 SYM_CODE_END(common_interrupt_return)
 _ASM_NOKPROBE(common_interrupt_return)
