@@ -1144,6 +1144,15 @@ SYM_CODE_END(error_entry)
 SYM_CODE_START_LOCAL(error_return)
 	UNWIND_HINT_REGS
 	DEBUG_ENTRY_ASSERT_IRQS_OFF
+
+#ifdef CONFIG_SYMBIOTE
+	pushq	%rax
+	call	symbi_check_elevate
+	testb	$0x1, %al
+	popq	%rax
+	jnz	symbi_return_to_usermode
+#endif
+
 	testb	$3, CS(%rsp)
 	jz	restore_regs_and_return_to_kernel
 	jmp	swapgs_restore_regs_and_return_to_usermode
