@@ -1150,7 +1150,11 @@ SYM_CODE_START_LOCAL(error_return)
 	call	symbi_check_elevate
 	testb	$0x1, %al
 	popq	%rax
-	jnz	symbi_return_to_usermode
+	jz	.Lsymbi_check_elevate_done
+	movq $__KERNEL_CS, CS(%rsp)
+	movq $0x18, SS(%rsp)
+
+.Lsymbi_check_elevate_done:
 #endif
 
 	testb	$3, CS(%rsp)
