@@ -584,10 +584,15 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
 .Lswapgs_and_iret:
 	swapgs
 	CLEAR_CPU_BUFFERS
+#ifdef CONFIG_SYMBIOTE
+	jmp .Lnative_iret
+#else 
 	/* Assert that the IRET frame indicates user mode. */
 	testb	$3, 8(%rsp)
 	jnz	.Lnative_iret
 	ud2
+#endif
+
 
 #ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
 .Lpti_restore_regs_and_return_to_usermode:
@@ -634,6 +639,11 @@ SYM_INNER_LABEL(restore_regs_and_return_to_kernel, SYM_L_GLOBAL)
 	ud2
 1:
 #endif
+
+	testb	$0xff00, CS(%rsp)
+	jz	.Lclear_CS
+	movq	$0x10, CS(%rsp)
+.Lclear_CS:
 	POP_REGS
 	addq	$8, %rsp	/* skip regs->orig_ax */
 	/*
@@ -746,7 +756,7 @@ native_irq_return_ldt:
 #ifdef CONFIG_SYMBIOTE
 SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
 
-
+	//Do we need IBRS_EXIT here?
 	STACKLEAK_ERASE
 	POP_REGS pop_rdi=0
 
@@ -1145,20 +1155,23 @@ SYM_CODE_START_LOCAL(error_return)
 	UNWIND_HINT_REGS
 	DEBUG_ENTRY_ASSERT_IRQS_OFF
 
+
+	testb	$3, CS(%rsp)
+	jz	restore_regs_and_return_to_kernel
+
+
 #ifdef CONFIG_SYMBIOTE
 	pushq	%rax
 	call	symbi_check_elevate
 	testb	$0x1, %al
 	popq	%rax
 	jz	.Lsymbi_check_elevate_done
+	//fixup and jump to our exit path
 	movq $__KERNEL_CS, CS(%rsp)
 	movq $0x18, SS(%rsp)
 
 .Lsymbi_check_elevate_done:
 #endif
-
-	testb	$3, CS(%rsp)
-	jz	restore_regs_and_return_to_kernel
 	jmp	swapgs_restore_regs_and_return_to_usermode
 SYM_CODE_END(error_return)
 

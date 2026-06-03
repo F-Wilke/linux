@@ -923,6 +923,15 @@ DEFINE_IDTENTRY_RAW(exc_int3)
 asmlinkage __visible noinstr struct pt_regs *sync_regs(struct pt_regs *eregs)
 {
 	struct pt_regs *regs = (struct pt_regs *)current_top_of_stack() - 1;
+
+	#ifdef CONFIG_SYMBIOTE
+	long stack_diff = (long)current_top_of_stack() - (long)eregs;
+	if (stack_diff > 0 && stack_diff < THREAD_SIZE) {
+		return eregs; // No need to switch stack, we're already on the thread stack.
+	}
+	#endif
+
+
 	if (regs != eregs)
 		*regs = *eregs;
 	return regs;
