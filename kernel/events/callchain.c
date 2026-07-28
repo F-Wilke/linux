@@ -234,33 +234,73 @@ get_perf_callchain(struct pt_regs *regs, u32 init_nr, bool kernel, bool user,
 	ctx.contexts       = 0;
 	ctx.contexts_maxed = false;
 
-	if (kernel && !user_mode(regs)) {
-		if (add_mark)
-			perf_callchain_store_context(&ctx, PERF_CONTEXT_KERNEL);
-		perf_callchain_kernel(&ctx, regs);
-	}
+#ifdef CONFIG_SYMBIOTE
+	if (current->symbiote_elevated) {
+		/*
+		 * Elevated tasks run at ring 0 (CS=0x10) but may be executing
+		 * user-space code with a user-space stack.  user_mode(regs) is
+		 * always false for elevated tasks, making it the wrong
+		 * discriminator.  Instead, use the sign of the saved stack
+		 * pointer: a kernel-space RSP means we are on a real kernel
+		 * stack (CPBS/BPBS kernel phase); a user-space RSP means all
+		 * frames live on the user stack (CPCS/BPCS, or CPBS/BPBS user
+		 * code phase).
+		 *
+		 * For the user-stack case use the actual NMI regs directly —
+		 * NOT task_pt_regs(current) — because task_pt_regs holds stale
+		 * values from the last kernel-entry point (the sym_elevate
+		 * syscall), not the live user-space state at NMI time.
+		 */
+		bool on_kernel_stack = ((long)regs->sp < 0);
 
-	if (user) {
-		if (!user_mode(regs)) {
-			if  (current->mm)
-				regs = task_pt_regs(current);
-			else
-				regs = NULL;
+		if (on_kernel_stack) {
+			if (kernel) {
+				if (add_mark)
+					perf_callchain_store_context(&ctx, PERF_CONTEXT_KERNEL);
+				perf_callchain_kernel(&ctx, regs);
+			}
+		} else {
+			if (user) {
+				if (crosstask)
+					goto exit_put;
+				if (add_mark)
+					perf_callchain_store_context(&ctx, PERF_CONTEXT_USER);
+				start_entry_idx = entry->nr;
+				perf_callchain_user(&ctx, regs); /* actual NMI regs, not task_pt_regs */
+				fixup_uretprobe_trampoline_entries(entry, start_entry_idx);
+			}
 		}
-
-		if (regs) {
-			if (crosstask)
-				goto exit_put;
-
+	} else
+#endif /* CONFIG_SYMBIOTE */
+	{
+		if (kernel && !user_mode(regs)) {
 			if (add_mark)
-				perf_callchain_store_context(&ctx, PERF_CONTEXT_USER);
+				perf_callchain_store_context(&ctx, PERF_CONTEXT_KERNEL);
+			perf_callchain_kernel(&ctx, regs);
+		}
 
-			start_entry_idx = entry->nr;
-			perf_callchain_user(&ctx, regs);
-			fixup_uretprobe_trampoline_entries(entry, start_entry_idx);
+		if (user) {
+			if (!user_mode(regs)) {
+				if  (current->mm)
+					regs = task_pt_regs(current);
+				else
+					regs = NULL;
+			}
+
+			if (regs) {
+				if (crosstask)
+					goto exit_put;
+
+				if (add_mark)
+					perf_callchain_store_context(&ctx, PERF_CONTEXT_USER);
+
+				start_entry_idx = entry->nr;
+				perf_callchain_user(&ctx, regs);
+				fixup_uretprobe_trampoline_entries(entry, start_entry_idx);
+			}
 		}
 	}
-
+	
 exit_put:
 	put_callchain_entry(rctx);
 

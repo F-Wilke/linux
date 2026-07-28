@@ -3057,7 +3057,22 @@ static unsigned long guest_misc_flags(struct pt_regs *regs)
 
 static unsigned long host_misc_flags(struct pt_regs *regs)
 {
-	if (user_mode(regs))
+#ifdef CONFIG_SYMBIOTE
+	/*
+	 * Elevated tasks run at ring 0 (CS=0x10) so user_mode(regs) is
+	 * always false regardless of whether user or kernel code is
+	 * executing.  Use the sign of the instruction pointer instead:
+	 * all kernel code lives at negative canonical addresses on x86-64,
+	 * all user code lives at positive canonical addresses.
+	 */
+	if (current->symbiote_elevated) {
+		if ((long)regs->ip >= 0)
+			return PERF_RECORD_MISC_USER;
+		else
+			return PERF_RECORD_MISC_KERNEL;
+	}
+#endif /* CONFIG_SYMBIOTE */
+        if (user_mode(regs))
 		return PERF_RECORD_MISC_USER;
 	else
 		return PERF_RECORD_MISC_KERNEL;

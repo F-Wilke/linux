@@ -136,6 +136,64 @@ void perf_get_regs_user(struct perf_regs *regs_user,
 	struct pt_regs *regs_user_copy = this_cpu_ptr(&nmi_user_regs);
 	struct pt_regs *user_regs = task_pt_regs(current);
 
+#ifdef CONFIG_SYMBIOTE
+	/*
+	 * For elevated tasks the NMI regs have CS=0x10 (ring 0) but may
+	 * reflect genuine user-space execution state (user-space RIP/RSP/RBP).
+	 * task_pt_regs(current) is stale (saved at sym_elevate() call time).
+	 *
+	 * If the NMI-time RSP is in user space (positive, CPCS/BPCS/CPBS
+	 * user-code phase), use the actual NMI regs as the source of user
+	 * register values — they contain the live user-space state at sample
+	 * time.
+	 *
+	 * If the NMI-time RSP is on a kernel stack (negative, CPBS/BPBS
+	 * kernel phase), the task was genuinely executing kernel code; report
+	 * no user regs for this sample.
+	 */
+	if (current->symbiote_elevated) {
+		if ((long)regs->sp >= 0) {
+			/* user-space stack: NMI regs are the correct user state */
+			if (!in_nmi()) {
+				regs_user->regs = regs;
+				regs_user->abi = perf_reg_abi(current);
+				return;
+			}
+			/* In NMI: copy regs into per-cpu buffer (same pattern as below) */
+			regs_user_copy->ip     = regs->ip;
+			regs_user_copy->ax     = regs->ax;
+			regs_user_copy->cx     = regs->cx;
+			regs_user_copy->dx     = regs->dx;
+			regs_user_copy->si     = regs->si;
+			regs_user_copy->di     = regs->di;
+			regs_user_copy->r8     = regs->r8;
+			regs_user_copy->r9     = regs->r9;
+			regs_user_copy->r10    = regs->r10;
+			regs_user_copy->r11    = regs->r11;
+			regs_user_copy->orig_ax = regs->orig_ax;
+			regs_user_copy->flags  = regs->flags;
+			regs_user_copy->sp     = regs->sp;
+			regs_user_copy->bp     = regs->bp;
+			regs_user_copy->bx     = regs->bx;
+			regs_user_copy->r12    = regs->r12;
+			regs_user_copy->r13    = regs->r13;
+			regs_user_copy->r14    = regs->r14;
+			regs_user_copy->r15    = regs->r15;
+			/* Report as user ABI; CS/SS are ring-0 for elevated tasks
+			 * but all general-purpose registers reflect user state. */
+			regs_user_copy->cs     = __USER_CS;
+			regs_user_copy->ss     = __USER_DS;
+			regs_user->abi         = PERF_SAMPLE_REGS_ABI_64;
+			regs_user->regs        = regs_user_copy;
+		} else {
+			/* kernel-stack RSP: task was in kernel code, no user regs */
+			regs_user->abi  = PERF_SAMPLE_REGS_ABI_NONE;
+			regs_user->regs = NULL;
+		}
+		return;
+	}
+#endif /* CONFIG_SYMBIOTE */
+
 	if (!in_nmi()) {
 		regs_user->regs = user_regs;
 		regs_user->abi = perf_reg_abi(current);
