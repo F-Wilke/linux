@@ -24,7 +24,6 @@
 #include <asm/ia32.h>
 
 #ifdef CONFIG_SYMBIOTE
-
 struct SymbiReg {
   union {
     uint64_t raw;
@@ -44,139 +43,157 @@ struct SymbiReg {
 }__attribute__((packed));
 
 uint64_t symbi_check_elevate(void);
-uint64_t symbi_check_elevate(){
+int symbi_fast_lower_iret(void);
+int symbi_fast_lower_sysret(void);
+void symbi_print_user_reg_state(struct pt_regs * regs);
+void symbi_query(struct pt_regs* regs);
+void symbi_lower(struct pt_regs* regs, struct SymbiReg* sreg);
+void symbi_toggle_nosmap(int direction);
+void symbi_toggle_nosmep(int direction);
+void arch_apply_smep_smap(unsigned disable_smep, unsigned disable_smap);
+void symbi_elevate(struct pt_regs* regs, struct SymbiReg* sreg);
+void symbi_debug_entry(struct pt_regs *regs, struct SymbiReg *sreg);
+unsigned long arch_elevate(unsigned long flags);
+
+uint64_t symbi_check_elevate(void)
+{
   return current->symbiote_elevated;
 }
 
 //this is to be called from an elevated process.
-__attribute((unused)) __attribute((naked)) int symbi_fast_lower_iret(void) {
+int symbi_fast_lower_iret(void)
+{
     register long int rsp;
+    
     __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
-    if (rsp < 0) //we need to be on the user stack 
+    
+    if ((long)rsp < 0) { //we need to be on the user stack 
       return -1;
+    }
 
   current->symbiote_elevated = 0;
 
     // DO_IRET_LOWER;
     __asm__ __volatile__ ( 
       "lea 8(%%rsp), %%rax;" 
-      "pushq $0x2b;" 
+      "pushq %[user_ds];" 
       "pushq %%rax;" 
-      "pushq $0x202;"
-      "pushq $0x33;"
+      "pushq $0x202;"       // eflags: enable interrupts (IF=1), rsvd =1 
+      "pushq %[user_cs];"
       "pushq -8(%%rax);"
       "cli;" 
-      "movq $0x0, %%rax;"
+      "xorq %%rax, %%rax;"
       "wrgsbase %%rax;"
-      "iretq;" 
-      ::: "memory" 
+      "iretq;"
+      :
+      : [user_ds] "i" (__USER_DS),
+	[user_cs] "i" (__USER_CS)
+      : "rax", "memory" 
     ); 
-
+    unreachable(); // above iret's
 }
 
-
-__attribute((unused)) __attribute((naked)) int symbi_fast_lower_sysret(void) {
-    register long int rsp;
+int symbi_fast_lower_sysret(void)
+{
+    long int rsp;
+    
     __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
-    if (rsp < 0) //we need to be on the user stack 
-      return -1;
 
+    if ((long)rsp < 0) { //we need to be on the user stack 
+      return -1;
+    }
   current->symbiote_elevated = 0;
 
     // DO_IRET_LOWER;
     __asm__ __volatile__ ( 
       "cli;" 
-      "movq (%%rsp), %%rcx;" 
-      "movq $0x202, %%r11;"
-      "addq $8, %%rsp;"   //sysret obviously doesn't pop the return address
-      "movq $0x0, %%rax;"
-      "wrgsbase %%rax;"
+      "movq (%%rsp), %%rcx;"  // target user RIP into RCX for sysretq 
+      "movq $0x202, %%r11;"   // target user eflags into R11 for sysretq
+      "addq $8, %%rsp;"       // move stack pointer past the return address
+      "xorq %%rax, %%rax;"
+      "wrgsbase %%rax;"       // Restore user GS base context
       "sysretq;" 
-      ::: "memory"
+      :
+      :
+      : "rcx", "r11", "rax", "memory"
     ); 
-
+    unreachable(); // above sysret's
 }
 
-void symbi_print_user_reg_state(struct pt_regs * regs){
+void symbi_print_user_reg_state(struct pt_regs * regs)
+{
   printk("IP %#lx\n", regs->ip);
   printk("SP %#lx\n", regs->sp);
-  printk("CS %#lx\n", regs->cs);
-  printk("SS %#lx\n", regs->ss);
+  printk("CS %#x\n", regs->cs);
+  printk("SS %#x\n", regs->ss);
   printk("FG %#lx\n", regs->flags);
   printk("\n");
 }
 
-void symbi_query(struct pt_regs* regs){
+void symbi_query(struct pt_regs* regs)
+{
   int ret = symbi_check_elevate();
   if(ret & 1){
-    regs->ss = 0x18;
-    regs->cs = 0x10;
+    regs->ss = __KERNEL_DS;
+    regs->cs = __KERNEL_CS;
   }else{
-    BUG_ON(regs->cs != 0x33);
-    BUG_ON(regs->ss != 0x2b);
+    BUG_ON(regs->cs != __USER_CS);
+    BUG_ON(regs->ss != __USER_DS);
   }
 }
 
-void symbi_lower(struct pt_regs* regs, struct SymbiReg* sreg){
+void symbi_lower(struct pt_regs* regs, struct SymbiReg* sreg)
+{
   if(current->symbiote_elevated == 1 ){
     current->symbiote_elevated = 0;
   } else{
-    printk("Trying to lower non elevated task???\n");
+    pr_warn("symbiote: Trying to lower non elevated task: PID %d (%s)\n",
+	    current->pid, current->comm);
   }
 
   // User interrupts better be enabled....
-  if( (regs->flags & (1<<9)) == 0){
+  if(!(regs->flags & X86_EFLAGS_IF)){
     if(sreg->debug){
-      printk("Warning: attempted lowering with user interrupts disabled... enabling!");
+      pr_warn("symbiote: Trying to lower with user interrupts disabled... enabling!\n");
     }
-    regs->flags = regs->flags | (1<<9);
+    regs->flags |= X86_EFLAGS_IF;
   }
   // Established at syscall entry.
-  BUG_ON(regs->cs != 0x33);
-  BUG_ON(regs->ss != 0x2b);
+  BUG_ON(regs->cs != __USER_CS);
+  BUG_ON(regs->ss != __USER_DS);
 }
 
-// Something is prob broken in my inline assembly, don't know why normal optimization breaks...
-void __attribute__((optimize("O0"))) symbi_toggle_nosmap(int direction){
+void symbi_toggle_nosmap(int direction)
+{
   // 1: disable smap
   // 0: enable smap
-  uint64_t cr4;
-  uint64_t x86_CR4_SMAP = 1 << 21; // XXX just trying the smap one
-
-  asm volatile("movq %%cr4,%0" : "=r"( cr4 ));
-  if(direction){
-    cr4 &= ~x86_CR4_SMAP;
-  }else{
-    cr4 |= x86_CR4_SMAP;
+  if (direction) {
+    cr4_clear_bits(X86_CR4_SMAP);
+  } else {
+    cr4_set_bits(X86_CR4_SMAP);
   }
-	asm volatile("mov %0,%%cr4": "+r" (cr4) : : "memory");
 }
 
-void symbi_toggle_nosmep(int direction){
+void symbi_toggle_nosmep(int direction)
+{
   // 1: disable smep
   // 0: enable smep
-  uint64_t cr4;
-  uint64_t x86_CR4_SMEP = 1 << 20;
-
-  /* printk("symbi_toggle_nosmep direction is %d\n", direction); */
-  asm volatile("movq %%cr4,%0" : "=r"( cr4 ));
-  // When this bit (20) is set, smep is enabled.
-  if(direction){
-    cr4 &= ~x86_CR4_SMEP;
-  }else{
-    cr4 |= x86_CR4_SMEP;
+  if (direction) {
+    cr4_clear_bits(X86_CR4_SMEP);
+  } else {
+    cr4_set_bits(X86_CR4_SMEP);
   }
-	asm volatile("mov %0,%%cr4": "+r" (cr4) : : "memory");
-
 }
 
-void arch_apply_smep_smap(unsigned disable_smep, unsigned disable_smap) {
+void arch_apply_smep_smap(unsigned disable_smep, unsigned disable_smap)
+{
   symbi_toggle_nosmep(disable_smep);
   symbi_toggle_nosmap(disable_smap);
 }
 
 
-void symbi_elevate(struct pt_regs* regs, struct SymbiReg* sreg){
+void symbi_elevate(struct pt_regs* regs, struct SymbiReg* sreg)
+{
   // Swing symbiote reg
   if(current->symbiote_elevated == 1 ){
     printk("Already Elevated???\n");
@@ -186,17 +203,18 @@ void symbi_elevate(struct pt_regs* regs, struct SymbiReg* sreg){
   }
 
   // Modify stack memory used for iret. // x86 specific
-  regs->ss = 0x18;
-  regs->cs = 0x10;
+  regs->ss = __KERNEL_DS;
+  regs->cs = __KERNEL_CS;
 
   // Disable interrupts for user
   if(sreg->int_disable){
     /* printk("setting int disabled\n"); */
-    regs->flags= regs->flags & (~(1<<9)); // x86 specific
+    regs->flags &= ~X86_EFLAGS_IF;
   }
 }
 
-void symbi_debug_entry(struct pt_regs *regs, struct SymbiReg *sreg){
+void symbi_debug_entry(struct pt_regs *regs, struct SymbiReg *sreg)
+{
   printk("Elevate Syscall Case: ");
   // What case are we in?
   if(sreg->query){
@@ -250,7 +268,8 @@ void symbi_debug_entry(struct pt_regs *regs, struct SymbiReg *sreg){
   symbi_print_user_reg_state(regs);
 }
 
-unsigned long arch_elevate(unsigned long flags){
+unsigned long arch_elevate(unsigned long flags)
+{
   struct pt_regs *regs;
 
   /* local_irq_disable(); */

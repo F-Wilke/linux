@@ -3072,7 +3072,7 @@ static unsigned long host_misc_flags(struct pt_regs *regs)
 			return PERF_RECORD_MISC_KERNEL;
 	}
 #endif /* CONFIG_SYMBIOTE */
-        if (user_mode(regs))
+	if (user_mode(regs))
 		return PERF_RECORD_MISC_USER;
 	else
 		return PERF_RECORD_MISC_KERNEL;
