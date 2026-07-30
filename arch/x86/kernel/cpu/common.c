@@ -401,8 +401,15 @@ out:
 }
 
 /* These bits should not change their value after CPU init is finished. */
-static const unsigned long cr4_pinned_mask = X86_CR4_SMEP | X86_CR4_SMAP | X86_CR4_UMIP |
-					     X86_CR4_FSGSBASE | X86_CR4_CET | X86_CR4_FRED;
+static const unsigned long cr4_pinned_mask = (X86_CR4_SMEP | X86_CR4_SMAP | X86_CR4_UMIP |
+					      X86_CR4_FSGSBASE | X86_CR4_CET | X86_CR4_FRED)
+#ifdef CONFIG_SYMBIOTE
+  // to allow an elevated process to access the user side of the address space we must
+  // take SMEP and SMAP out of the pinned set so that the symbiote code can
+  // toggle these features
+  & ~(X86_CR4_SMEP | X86_CR4_SMAP)
+  ;
+#endif
 static DEFINE_STATIC_KEY_FALSE_RO(cr_pinning);
 static unsigned long cr4_pinned_bits __ro_after_init;
 
