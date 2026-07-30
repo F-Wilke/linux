@@ -1052,6 +1052,8 @@ unsigned 			symbiote_migrated:1;
 /* Used to create the same environment after cpu migration */
 unsigned            symbiote_disable_smep:1;
 unsigned            symbiote_disable_smap:1;
+unsigned            symbiote_enable_ac:1;    
+unsigned            symbiote_orig_ac:1;
 
 /* Used to signal symbiote status, needs to be byte to make it easily accessible from assembly */
 uint8_t			symbiote_elevated;

@@ -38,6 +38,7 @@ struct SymbiReg {
       uint64_t toggle_smap : 1; // Bit 8
       uint64_t ret         : 1; // Bit 9
       uint64_t fast_lower  : 1; // Bit 10
+      uint64_t enable_ac   : 1; // Bit 11
     };
   };
 }__attribute__((packed));
@@ -64,15 +65,25 @@ uint64_t symbi_check_elevate(void)
 int symbi_fast_lower_iret(void)
 {
     register long int rsp;
+    long eflags = (X86_EFLAGS_IF | X86_EFLAGS_RSVD);
     
     __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
     
     if ((long)rsp < 0) { //we need to be on the user stack 
       return -1;
     }
-
-  current->symbiote_elevated = 0;
-
+    
+    current->symbiote_elevated = 0;
+    
+    if (current->symbiote_enable_ac) {
+      if (current->symbiote_orig_ac) {
+	eflags |= X86_EFLAGS_AC;
+      } else {
+	eflags &= ~X86_EFLAGS_AC;
+      }
+      current->symbiote_enable_ac = 0;
+    }
+    
     // DO_IRET_LOWER;
     __asm__ __volatile__ ( 
       "lea 8(%%rsp), %%rax;" 
@@ -95,15 +106,26 @@ int symbi_fast_lower_iret(void)
 
 int symbi_fast_lower_sysret(void)
 {
-    long int rsp;
-    
-    __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
-
-    if ((long)rsp < 0) { //we need to be on the user stack 
-      return -1;
-    }
+  long int rsp;
+  long eflags = (X86_EFLAGS_IF | X86_EFLAGS_RSVD);
+  
+  __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
+  
+  if ((long)rsp < 0) { //we need to be on the user stack 
+    return -1;
+  }
+  
   current->symbiote_elevated = 0;
-
+  
+  if (current->symbiote_enable_ac) {
+    if (current->symbiote_orig_ac) {
+      eflags |= X86_EFLAGS_AC;
+    } else {
+      eflags &= ~X86_EFLAGS_AC;
+    }
+    current->symbiote_enable_ac = 0;
+  }
+  
     // DO_IRET_LOWER;
     __asm__ __volatile__ ( 
       "cli;" 
@@ -134,8 +156,12 @@ void symbi_query(struct pt_regs* regs)
 {
   int ret = symbi_check_elevate();
   if(ret & 1){
-    regs->ss = __KERNEL_DS;
-    regs->cs = __KERNEL_CS;
+    // JA: This looks suspcious I am changing to bug on
+    //
+    // regs->ss = __KERNEL_DS;
+    // regs->cs = __KERNEL_CS;
+    BUG_ON(regs->ss != __KERNEL_DS);
+    BUG_ON(regs->cs != __KERNEL_CS);
   }else{
     BUG_ON(regs->cs != __USER_CS);
     BUG_ON(regs->ss != __USER_DS);
@@ -231,7 +257,6 @@ void symbi_debug_entry(struct pt_regs *regs, struct SymbiReg *sreg)
   if(sreg->int_disable){
     printk("Return with interrupts disabled\n");
   }
-
   if(sreg->no_smep){
     printk("Return with SMEP disabled\n");
   } else {
@@ -244,6 +269,12 @@ void symbi_debug_entry(struct pt_regs *regs, struct SymbiReg *sreg)
     printk("Return with SMAP enabled\n");
   }
 
+  if(sreg->enable_ac){
+    printk("Return with AC enabled\n");
+  } else {
+    printk("Return WITHOUT changing AC enabled\n");
+  }
+  
   if(sreg->ret){
     printk("Return using ret instead of iret (switch NYI)\n");
   } else{
@@ -271,7 +302,19 @@ void symbi_debug_entry(struct pt_regs *regs, struct SymbiReg *sreg)
 unsigned long arch_elevate(unsigned long flags)
 {
   struct pt_regs *regs;
-
+  
+  // AC Semantics
+  // access control flag bit setting is a right pain in the ass
+  // Intel changes the meaning of this bit depending on your
+  // CPL.  In user mode it turns on alignment checking in
+  // supervisor mode it enables access control to be bypassed
+  // eg. ignore smep an smap --- page fault path checks this
+  // the faulting ac on CPL 0 faults to avoid user accesses
+  //  symbiote semantics.  caller can as us to turn the ac
+  //  bit on for elevated execution in which case lower will
+  //  restore the ac bit back to the process original value
+  int ac = -1;   // -1 don't f with ac by default
+  
   /* local_irq_disable(); */
   struct SymbiReg sreg;
   sreg.raw = flags;
@@ -286,17 +329,29 @@ unsigned long arch_elevate(unsigned long flags)
   // Careful with order, obviously only executes first matching.
   if(sreg.query){
     symbi_query(regs);
-
+    goto done;
   } else if(sreg.elevate){
     symbi_elevate(regs, &sreg);
     current->symbiote_disable_smap = sreg.no_smap;
     current->symbiote_disable_smep = sreg.no_smep;
-    
+    if (sreg.enable_ac && !current->symbiote_enable_ac) {
+      // we have been asked to enable ac state when elevated
+      // and we have not done this yet (first elevate)
+      // 1) cache processes original user meaning of the ac bit
+      // 2) note we have enabled
+      // 3) force it to one in the processes flags
+      current->symbiote_orig_ac   = regs->flags & X86_EFLAGS_AC;
+      current->symbiote_enable_ac = 1;
+      ac                          = 1;
+    }
   } else if(!sreg.elevate){
     symbi_lower(regs, &sreg);
     current->symbiote_disable_smap = 0;
     current->symbiote_disable_smep = 0;
-
+    if (current->symbiote_enable_ac) {
+      ac = current->symbiote_orig_ac;  // ac original value
+      current->symbiote_enable_ac = 0; 
+    }
   } else{
     // NOTE: Unconditional print and return.
     printk("Elevation error: Unexpected input %lx\n", flags);
@@ -310,8 +365,11 @@ unsigned long arch_elevate(unsigned long flags)
   if(sreg.toggle_smep){
     symbi_toggle_nosmep(sreg.no_smep);
   }
-
-
+  if (ac != -1) {
+    if (ac) regs->flags |= X86_EFLAGS_AC;
+    else regs->flags &= ~X86_EFLAGS_AC;
+  }
+ done:
   if(sreg.debug){
     printk("Elevate bit now %llx", symbi_check_elevate());
     symbi_print_user_reg_state(regs);
