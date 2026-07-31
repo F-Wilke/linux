@@ -48,6 +48,7 @@ static void __used common(void)
 	#endif
 #ifdef CONFIG_SYMBIOTE
 	OFFSET(TASK_symbiote_elevated, task_struct, symbiote_elevated);
+	OFFSET(TASK_symbiote_enable_ac, task_struct, symbiote_enable_ac);
 #endif
 
 	BLANK();

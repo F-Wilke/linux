@@ -65,7 +65,7 @@ uint64_t symbi_check_elevate(void)
 int symbi_fast_lower_iret(void)
 {
     register long int rsp;
-    long eflags = (X86_EFLAGS_IF | X86_EFLAGS_RSVD);
+    long eflags = (X86_EFLAGS_IF | X86_EFLAGS_FIXED);
     
     __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
     
@@ -89,7 +89,7 @@ int symbi_fast_lower_iret(void)
       "lea 8(%%rsp), %%rax;" 
       "pushq %[user_ds];" 
       "pushq %%rax;" 
-      "pushq $0x202;"       // eflags: enable interrupts (IF=1), rsvd =1 
+      "pushq %[eflags];"       // eflags: enable interrupts (IF=1), rsvd =1 
       "pushq %[user_cs];"
       "pushq -8(%%rax);"
       "cli;" 
@@ -98,7 +98,8 @@ int symbi_fast_lower_iret(void)
       "iretq;"
       :
       : [user_ds] "i" (__USER_DS),
-	[user_cs] "i" (__USER_CS)
+	[user_cs] "i" (__USER_CS),
+	[eflags]  "r" (eflags)
       : "rax", "memory" 
     ); 
     unreachable(); // above iret's
@@ -107,7 +108,7 @@ int symbi_fast_lower_iret(void)
 int symbi_fast_lower_sysret(void)
 {
   long int rsp;
-  long eflags = (X86_EFLAGS_IF | X86_EFLAGS_RSVD);
+  long eflags = (X86_EFLAGS_IF | X86_EFLAGS_FIXED);
   
   __asm__ __volatile__("mov %%rsp, %0" : "=r" (rsp));
   
@@ -130,13 +131,13 @@ int symbi_fast_lower_sysret(void)
     __asm__ __volatile__ ( 
       "cli;" 
       "movq (%%rsp), %%rcx;"  // target user RIP into RCX for sysretq 
-      "movq $0x202, %%r11;"   // target user eflags into R11 for sysretq
+      "movq %[eflags], %%r11;"   // target user eflags into R11 for sysretq
       "addq $8, %%rsp;"       // move stack pointer past the return address
       "xorq %%rax, %%rax;"
       "wrgsbase %%rax;"       // Restore user GS base context
       "sysretq;" 
-      :
-      :
+      : 
+      : [eflags] "r" (eflags)
       : "rcx", "r11", "rax", "memory"
     ); 
     unreachable(); // above sysret's
@@ -182,7 +183,9 @@ void symbi_lower(struct pt_regs* regs, struct SymbiReg* sreg)
     if(sreg->debug){
       pr_warn("symbiote: Trying to lower with user interrupts disabled... enabling!\n");
     }
-    regs->flags |= X86_EFLAGS_IF;
+    // JA: this seems wrong to me:   regs->flags |= X86_EFLAGS_IF;
+    //     harmonizing with fast lower semantics
+    regs->flags = (X86_EFLAGS_IF | X86_EFLAGS_FIXED);
   }
   // Established at syscall entry.
   BUG_ON(regs->cs != __USER_CS);
@@ -340,7 +343,9 @@ unsigned long arch_elevate(unsigned long flags)
       // 1) cache processes original user meaning of the ac bit
       // 2) note we have enabled
       // 3) force it to one in the processes flags
-      current->symbiote_orig_ac   = regs->flags & X86_EFLAGS_AC;
+      // Note: orig_ac is a bitfield use logic operators to convert test into
+      //       0 or 1
+      current->symbiote_orig_ac   = !!(regs->flags & X86_EFLAGS_AC); 
       current->symbiote_enable_ac = 1;
       ac                          = 1;
     }
