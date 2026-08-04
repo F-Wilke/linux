@@ -6679,12 +6679,45 @@ static bool try_to_block_task(struct rq *rq, struct task_struct *p,
 
 
 #ifdef CONFIG_SYMBIOTE
-/* Implemented in arch/x86/kernel/symbi_sched.S.
- * Switches to the SP0 kernel stack, calls schedule(),
- * switches back to the user stack, and returns normally via ret.
- * Called directly from __schedule() on an elevated CPCS task's user stack.
+/* A thunk used to "stack bracket" the call to __schedule
+ * from a constantly elevated task running on a constant user stack
+ * (CPCS). Thus effectively turning into CPBS for this call
+ * to ensure context switching invariants are maintained by
+ * treating this task like a kernel task voluntarily rescheduling.
+ * Stack switching must be done in assembly as it violates
+ * C ABI. We do not put it in a separate .S to ensure access
+ * to the  __schedule  symbol that is static to this compilation unit.
+ *
+ * The pattern for writing this kind of code already exists in the kernel
+ * see: error-inject.c use of top-level asm() in .c 
  */
-void symbi_voluntary_cs_asm(void);
+
+asm(
+    ".text\n"
+    ".type symbi_bs__schedule_thunk, @function\n"
+    "symbi_bs__schedule_thunk:\n\t"
+    /* CPBS thunk: sched_mode passed in %rdi (first arg per ABI)
+     * Save user RSP in r13 (callee-saved, preserved by __switch_to_asm).
+     * Switch/pivot stacks from task's user stack to tasks kernel (SP0)
+     * stack and call __schedule(sched_mode) again with kernel stack
+     * maintaining user stack pointer via pushed r13 value. On
+     * return we switch back and ret.  By adding the thunk
+     * to the call chain at the top of __schedule, when elevated
+     * CPCS task is detected we don't have to modify the call sites,
+     * rather we redirect through this thunk.
+     */
+    "movq %rsp, %r13\n\t"
+    "movq %gs:cpu_current_top_of_stack, %rsp\n\t"
+    "call __schedule\n\t"
+    "movq %r13, %rsp\n\t"
+    ASM_RET
+    ".size symbi_bs__schedule_thunk, .-symbi_bs__schedule_thunk\n"
+);
+
+/* The above definition purposefully does not use .globl to keep
+ * the symbol static to this compilation unit just like __schedule
+ */
+void symbi_bs__schedule_thunk(int sched_mode);
 #endif /* CONFIG_SYMBIOTE */
 
 /*
@@ -6750,7 +6783,7 @@ static void __sched notrace __schedule(int sched_mode)
    */
   if (unlikely(current->symbiote_elevated &&
                (long)current_stack_pointer >= 0)) {
-    symbi_voluntary_cs_asm();
+    symbi_bs__schedule_thunk(sched_mode);
     return;
   }
 
