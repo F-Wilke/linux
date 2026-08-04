@@ -96,14 +96,15 @@ int symbi_fast_lower_iret(void)
       "xorq %%rax, %%rax;"
       "wrgsbase %%rax;"
       "iretq;"
+      "int3;"
       :
       : [user_ds] "i" (__USER_DS),
 	[user_cs] "i" (__USER_CS),
 	[eflags]  "r" (eflags)
       : "rax", "memory" 
-    ); 
-    unreachable(); // above iret's
-}
+    );
+    BUG(); // iretq above never returns; ud2 prevents fall-through 
+ }
 
 int symbi_fast_lower_sysret(void)
 {
@@ -135,12 +136,14 @@ int symbi_fast_lower_sysret(void)
       "addq $8, %%rsp;"       // move stack pointer past the return address
       "xorq %%rax, %%rax;"
       "wrgsbase %%rax;"       // Restore user GS base context
-      "sysretq;" 
+      "sysretq;"
+      UNWIND_HINT_UNDEFINED
+      "int3;"
       : 
       : [eflags] "r" (eflags)
       : "rcx", "r11", "rax", "memory"
     ); 
-    unreachable(); // above sysret's
+    BUG(); // above sysret never returns 
 }
 
 void symbi_print_user_reg_state(struct pt_regs * regs)

@@ -640,10 +640,28 @@ SYM_INNER_LABEL(restore_regs_and_return_to_kernel, SYM_L_GLOBAL)
 1:
 #endif
 
-	testb	$0xff00, CS(%rsp)
-	jz	.Lclear_CS
-	movq	$0x10, CS(%rsp)
-.Lclear_CS:
+#ifdef CONFIG_SYMBIOTE
+
+// FIXME: JA: We believe this code might interact with our forgery we do
+// 	  in efasm.kS -- where we convert a kernel CS back to a user
+//        CS.  That being said we have not seen it trigger so
+//        for the moment we doing assert so that we can catch the case
+//        and better understand it	
+// Version 1: conditional fix
+//	cmpq	$__KERNEL_CS, CS(%rsp)
+//	je	.Lskip_CS_update
+//	movq	$__KERNEL_CS, CS(%rsp)
+//.Lskip_CS_update:
+// Version 2: unconditionally 
+//	movq	$__KERNEL_CS, CS(%rsp)
+
+	cmpq	$__KERNEL_CS, CS(%rsp)
+	je	.Lskip_CS_update
+	ud2     // I guess it happened we got here and CS was not the kernel CS
+	// if this is reasonable then replace this code with either
+	// version 1 or 2 in the comment above  (assume 2 is most sensible)
+.Lskip_CS_update:	
+#endif 	
 	POP_REGS
 	addq	$8, %rsp	/* skip regs->orig_ax */
 	/*
@@ -795,7 +813,9 @@ SYM_INNER_LABEL(symbi_return_to_usermode, SYM_L_GLOBAL)
 	movq	8(%rsp), %rsp		/* swing to user stack */
 	
 	ANNOTATE_NOENDBR
-	jmp	*%rcx	
+	ANNOTATE_RETPOLINE_SAFE 
+	jmp	*%rcx
+	int3
 #endif
 
 SYM_CODE_END(common_interrupt_return)
