@@ -2495,13 +2495,6 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 				   struct task_struct *p, int new_cpu)
 {
-#if 0
-#ifdef CONFIG_SYMBIOTE
-	int old_cpu;
-	old_cpu = task_cpu(p);
-#endif
-#endif
-
 	lockdep_assert_rq_held(rq);
 
 	deactivate_task(rq, p, DEQUEUE_NOCLOCK);
@@ -3361,13 +3354,13 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 		rseq_migrate(p);
 		sched_mm_cid_migrate_from(p);
 		perf_event_task_migrate(p);
-		#ifdef CONFIG_SYMBIOTE
+#ifdef CONFIG_SYMBIOTE
 		// Indicate that a symbiote thread has migrated cores in order
 		// to properly "fix" the gsbase value in context_switch() call.
-		if (p->symbiote_elevated) {
+		if (unlikely(p->symbiote_elevated)) {
 			p->symbiote_migrated = 1;
 		}
-		#endif
+#endif
 	}
 
 	__set_task_cpu(p, new_cpu);
@@ -3750,7 +3743,7 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 		// Indicate that a symbiote thread has migrated cores in order
 		// to properly "fix" the gsbase value in context_switch() call.
 		// At this point a symbiote thread has been migrated while not being on a runqueue (i.e. sleeping, blocked).
-		if (p->symbiote_elevated) {
+		if (unlikely(p->symbiote_elevated)) {
 			p->symbiote_migrated = 1;
 		}
 #endif
@@ -5386,7 +5379,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	unsigned int gs_low, gs_high;
 	unsigned long long kernel_gs;
 
-    if (next->symbiote_migrated) {
+	if (unlikely(next->symbiote_migrated)) {
 		BUG_ON(smp_processor_id() != task_cpu(next));
 
 		// Read the GSBASE value from the MSR
@@ -6684,6 +6677,16 @@ static bool try_to_block_task(struct rq *rq, struct task_struct *p,
 	return true;
 }
 
+
+#ifdef CONFIG_SYMBIOTE
+/* Implemented in arch/x86/kernel/symbi_sched.S.
+ * Switches to the SP0 kernel stack, calls schedule(),
+ * switches back to the user stack, and returns normally via ret.
+ * Called directly from __schedule() on an elevated CPCS task's user stack.
+ */
+void symbi_voluntary_cs_asm(void);
+#endif /* CONFIG_SYMBIOTE */
+
 /*
  * __schedule() is the main scheduler function.
  *
@@ -6725,6 +6728,34 @@ static bool try_to_block_task(struct rq *rq, struct task_struct *p,
  */
 static void __sched notrace __schedule(int sched_mode)
 {
+#ifdef CONFIG_SYMBIOTE
+  /*
+   * Constant Elevated task running on a constant user stack (CPCS)
+   * on its user stack: intercept call chain before
+   * switch_mm_irqs_off() unmaps it.  symbi_voluntary_cs_asm() switches
+   * to the SP0 kernel stack, runs schedule() there (exercising the normal
+   * kernel thread context switch path), then when it resumes it swtich
+   * back to this user stack and returns via ret --
+   * landing at the return; below, which runs __schedule__()'s
+   * epilogue to unwind back to the elevated task's user stack call chain.
+   * Details: This implies that the call to schedule() on the task kernel
+   * stack made in symbi_voluntary_cs_asm() can lead to a context swtich
+   * to another task which proceeds as a standard voluntary kernel
+   * thread reschedule. The state left on the task's kernel stack will
+   * be used to resume symbi_voluntary_cs_asm on the kernel stack via
+   * a ret and then symbi_voluntary_cs_asm will continue to do 
+   * a pivot back to this user stack and ret back, thus resulting
+   * in the return after the call to symbi_voluntary_cs_asm that
+   * naturally unwinds this stack.
+   */
+  if (unlikely(current->symbiote_elevated &&
+               (long)current_stack_pointer >= 0)) {
+    symbi_voluntary_cs_asm();
+    return;
+  }
+
+#endif /* CONFIG_SYMBIOTE */
+  
 	struct task_struct *prev, *next;
 	/*
 	 * On PREEMPT_RT kernel, SM_RTLOCK_WAIT is noted
