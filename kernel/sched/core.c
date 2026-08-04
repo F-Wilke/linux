@@ -6697,19 +6697,34 @@ asm(
     ".type symbi_bs__schedule_thunk, @function\n"
     "symbi_bs__schedule_thunk:\n\t"
     /* CPBS thunk: sched_mode passed in %rdi (first arg per ABI)
-     * Save user RSP in r13 (callee-saved, preserved by __switch_to_asm).
+     * Save user RSP in r13 (callee-saved, preserved by C ABI x86 convention
+     * by all down stream functions called by this function. But it must ultimately also be
+     * adhered to by the assembly path that implements the final bit of thread switching logic.
+     * Indeed, Linux's assembly "switch_to" routine: __switch_to_asm@entry_64.S does.
+     * If you examine this  code you will see that it carefully pushes and pops all
+     * callee saved registers (%rbp, %rbx, and r12-r15)
+     *
+     * This means while we don't know exactly where our user stack pointer will
+     * get saved -- it will eventually make it to the kernel stack after
+     * we switch to it and invoke __schedule in an C ABI compliant way
+     *
      * Switch/pivot stacks from task's user stack to tasks kernel (SP0)
      * stack and call __schedule(sched_mode) again with kernel stack
-     * maintaining user stack pointer via pushed r13 value. On
-     * return we switch back and ret.  By adding the thunk
-     * to the call chain at the top of __schedule, when elevated
+     * maintaining user stack pointer by spilling and placing it in r13. On
+     * return we switch back, restore rsp from r13 and its original value
+     * and ret.
+     *
+     * By adding the thunk to the call chain at the top of __schedule, when an elevated
      * CPCS task is detected we don't have to modify the call sites,
      * rather we redirect through this thunk.
      */
-    "movq %rsp, %r13\n\t"
-    "movq %gs:cpu_current_top_of_stack, %rsp\n\t"
-    "call __schedule\n\t"
-    "movq %r13, %rsp\n\t"
+    "pushq %r13\n\t"                               /* spill orig_r13 to user stack so we can use it (callee save) : push to user space is safe due to elevated execution support(eg. AC=1: SMAP Disabled)*/
+    "movq %rsp, %r13\n\t"                          /* save orig_rsp - 8 (-8 due to push) into a r13: functions called will save as needed (see comments above)*/
+    "movq %gs:cpu_current_top_of_stack, %rsp\n\t"  /* switch to top of task's kernel stack */
+    "call __schedule\n\t"                          /* seed a new fresh call chain to __schedule on the task's kernel stack */
+                                                   /* we got scheduled back in and rsp will be restored to a location on tasks's kernel stack (the way we left it) */
+    "movq %r13, %rsp\n\t"                          /* restore rsp from r13 -- which will point -8 bytes from the original rsp when we were called (points orig_r13)*/
+    "popq %r13\n\t"                                /* finally restore r13 to original state (our job since it is a callee save :-)) and get rsp = orig_rsp (points to return address */
     ASM_RET
     ".size symbi_bs__schedule_thunk, .-symbi_bs__schedule_thunk\n"
 );
