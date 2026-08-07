@@ -6799,6 +6799,17 @@ static void __sched notrace __schedule(int sched_mode)
   if (unlikely(current->symbiote_elevated &&
                (long)current_stack_pointer >= 0)) {
     symbi_bs__schedule_thunk(sched_mode);
+    {    
+      struct pt_regs *regs;
+      regs = task_pt_regs(current);
+      if (regs->cs != __KERNEL_CS || regs->ss != __KERNEL_DS) {
+	pr_warn("Elevated task %d (%s): Lost kernel segements "
+		"cs:0x%hx ss:0x%hx. Resetting\n", current->pid,
+		current->comm, regs->cs, regs->ss);
+	regs->cs = __KERNEL_CS;
+	regs->ss = __KERNEL_DS;
+      }
+    }
     return;
   }
 
