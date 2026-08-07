@@ -22,8 +22,11 @@
 
 #include <asm/elf.h>
 #include <asm/ia32.h>
+#include <asm/processor.h>
 
 #ifdef CONFIG_SYMBIOTE
+EXPORT_SYMBOL(cpu_current_top_of_stack);
+
 struct SymbiReg {
   union {
     uint64_t raw;
